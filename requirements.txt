@@ -5,3 +5,5 @@ websocket-client
 scikit-learn
 numpy
 python-dotenv
+matplotlib
+mplfinance

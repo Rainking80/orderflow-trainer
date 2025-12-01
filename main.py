@@ -8,10 +8,16 @@ import threading
 import time
 import io
 import os
+import sys
+import signal
 from datetime import datetime, timedelta, timezone
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
 from dotenv import load_dotenv
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
+import matplotlib.pyplot as plt
+import mplfinance as mpf
 
 # Load environment variables
 load_dotenv()
@@ -23,6 +29,8 @@ AUTH_TOKEN = os.getenv("AUTH_BEARER_TOKEN", "4kEZu6v_W5y2oNf8oZg2L1b3bO8hJ8mX")
 # Telegram configuration
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+MODEL_FILE = "lgb_model.txt"
 
 class MarketPredictor:
     def __init__(self):
@@ -41,6 +49,14 @@ class MarketPredictor:
         self.previous_probs = {'NEUTRAL': 0.0, 'PUMP': 0.0, 'DUMP': 0.0}
         self.last_hourly_message_time = None
         self.last_prediction_data = None
+        self.active_events = {'NEUTRAL': False, 'PUMP': False, 'DUMP': False}
+        self.ws = None
+
+    def handle_exit(self, signum, frame):
+        print(f"\nReceived signal {signum}. Exiting gracefully...")
+        if self.ws:
+            self.ws.close()
+        sys.exit(0)
 
     def send_telegram_message(self, message):
         """Send a message via Telegram Bot API"""
@@ -62,6 +78,143 @@ class MarketPredictor:
         except Exception as e:
             print(f"Failed to send Telegram message: {e}")
             return False
+
+    def send_telegram_photo(self, photo_bytes, caption=""):
+        """Send a photo via Telegram Bot API"""
+        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+            print("Telegram credentials not configured. Skipping photo.")
+            return False
+        
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+            files = {
+                'photo': ('chart.png', photo_bytes, 'image/png')
+            }
+            data = {
+                'chat_id': TELEGRAM_CHAT_ID,
+                'caption': caption,
+                'parse_mode': 'HTML'
+            }
+            response = requests.post(url, files=files, data=data, timeout=30)
+            response.raise_for_status()
+            print("Telegram photo sent successfully.")
+            return True
+        except Exception as e:
+            print(f"Failed to send Telegram photo: {e}")
+            return False
+
+    def generate_candle_chart(self, df_20min):
+        """Generate a candlestick chart from the last 20 minutes of data"""
+        try:
+            # Prepare data for mplfinance
+            # mplfinance expects DatetimeIndex and columns: Open, High, Low, Close, Volume
+            chart_df = df_20min[['start_ts', 'open', 'high', 'low', 'close', 'total_volume']].copy()
+            chart_df.columns = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']
+            chart_df.set_index('Date', inplace=True)
+            
+            # Create the chart
+            fig, axes = mpf.plot(
+                chart_df,
+                type='candle',
+                style='charles',
+                title=f'BTC Price - Last {len(chart_df)} Candles (1m)',
+                ylabel='Price (USD)',
+                volume=True,
+                ylabel_lower='Volume',
+                figsize=(12, 8),
+                returnfig=True
+            )
+            
+            # Save to bytes buffer
+            buf = io.BytesIO()
+            fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+            buf.seek(0)
+            plt.close(fig)
+            
+            return buf.getvalue()
+        except Exception as e:
+            print(f"Error generating candle chart: {e}")
+            return None
+
+    def send_followup(self, category, trigger_price, trigger_time, label):
+        """Send follow-up notification with chart"""
+        try:
+            # 1. Get Data (Locked)
+            with self.lock:
+                if not self.latest_data:
+                    return
+                # Copy data to avoid holding lock during processing
+                data_copy = list(self.latest_data)
+            
+            # 2. Process Data (Unlocked)
+            df_all = pd.DataFrame(data_copy)
+            if 'start_ts' not in df_all.columns:
+                return
+            
+            # Handle mixed types
+            df_all['start_ts'] = pd.to_datetime(df_all['start_ts'])
+            df_all.set_index('start_ts', inplace=True)
+            
+            # Resample to 1m
+            df_1m = df_all.resample('1min').agg({
+                'open': 'first',
+                'high': 'max',
+                'low': 'min',
+                'close': 'last',
+                'total_volume': 'sum'
+            }).dropna()
+            
+            if df_1m.empty:
+                return
+
+            current_price = df_1m.iloc[-1]['close']
+            
+            # Determine chart window
+            # Start from trigger_time - offset (60 mins before trigger to match initial chart)
+            offset = timedelta(minutes=60)
+            start_chart = trigger_time - offset
+            
+            # Filter data
+            df_chart = df_1m[df_1m.index >= start_chart].copy()
+            
+            # Generate chart
+            chart_bytes = None
+            if len(df_chart) >= 5:
+                # Reset index for plotting function
+                df_chart_reset = df_chart.reset_index()
+                # Rename columns to match what generate_candle_chart expects if needed
+                # But generate_candle_chart expects 'start_ts' which we have after reset_index
+                
+                print(f"Generating {label} follow-up chart for {category}...")
+                chart_bytes = self.generate_candle_chart(df_chart_reset)
+            
+            # Calculate stats
+            pct_change = (current_price - trigger_price) / trigger_price
+            
+            emoji = "➖"
+            if category == "PUMP":
+                emoji = "✅" if pct_change > 0 else "❌"
+            elif category == "DUMP":
+                emoji = "✅" if pct_change < 0 else "❌"
+            
+            message = f"⏱️ <b>{label} Follow-up: {category}</b>\n\n"
+            message += f"Trigger Price: ${trigger_price:.2f}\n"
+            message += f"Current Price: ${current_price:.2f}\n"
+            message += f"Change: {pct_change:.2%} {emoji}\n"
+            
+            if chart_bytes:
+                self.send_telegram_photo(chart_bytes, message)
+            else:
+                self.send_telegram_message(message)
+                
+        except Exception as e:
+            print(f"Error in follow-up: {e}")
+        finally:
+            # Reset flag if 2h
+            if label == "2h":
+                with self.lock:
+                    self.active_events[category] = False
+                    print(f"Reset active event for {category}")
 
     def check_and_send_notifications(self, timestamp, price, delta, direction, confidence, probs):
         """Check if notifications should be sent based on threshold crossing or hourly schedule"""
@@ -91,6 +244,23 @@ class MarketPredictor:
             
             # Check if crossed 60% threshold from below
             if prev_prob < threshold <= curr_prob:
+                # Check if event is already active
+                if self.active_events[category]:
+                    print(f"Skipping {category} alert - Timer already running.")
+                    continue
+                
+                # Set active
+                self.active_events[category] = True
+                
+                # Schedule timers
+                # 30 min timer
+                t30 = threading.Timer(30 * 60, self.send_followup, args=[category, price, timestamp, "30min"])
+                t30.start()
+                
+                # 2 hour timer
+                t120 = threading.Timer(2 * 60 * 60, self.send_followup, args=[category, price, timestamp, "2h"])
+                t120.start()
+                
                 message = f"🚨 <b>ALERT: {category} crossed 60% threshold!</b>\n\n"
                 message += f"Current Price: ${price:.2f}\n"
                 message += f"Order Flow Imbalance (OFI): {delta:.2f}\n\n"
@@ -101,6 +271,52 @@ class MarketPredictor:
                 message += f"  - DUMP:    {probs[2]:.2%}"
                 
                 self.send_telegram_message(message)
+                
+                # Collect data for chart
+                # Note: self.lock is already held by the caller (on_message method)
+                if len(self.latest_data) > 0:
+                    # Convert to DataFrame
+                    df_all = pd.DataFrame(self.latest_data)
+                    
+                    # Ensure start_ts is datetime
+                    if 'start_ts' in df_all.columns:
+                        # Handle mixed types (strings from WS, datetimes from history)
+                        df_all['start_ts'] = pd.to_datetime(df_all['start_ts'])
+                        
+                        # Set index for resampling
+                        df_all.set_index('start_ts', inplace=True)
+                        
+                        # Resample to 1-minute candles
+                        # Aggregation rules:
+                        # Open: first
+                        # High: max
+                        # Low: min
+                        # Close: last
+                        # Volume: sum
+                        df_1m = df_all.resample('1min').agg({
+                            'open': 'first',
+                            'high': 'max',
+                            'low': 'min',
+                            'close': 'last',
+                            'total_volume': 'sum'
+                        }).dropna()
+                        
+                        # Take up to the last 60 candles (minimum 5)
+                        if len(df_1m) >= 5:
+                            df_chart = df_1m.tail(60).copy()
+                            
+                            # Reset index to make start_ts a column again for generate_candle_chart
+                            df_chart = df_chart.reset_index()
+                            
+                            print(f"Generating candle chart with {len(df_chart)} 1m candles...")
+                            chart_bytes = self.generate_candle_chart(df_chart)
+                            
+                            if chart_bytes:
+                                caption = f"📈 <b>BTC Price Chart - Last {len(df_chart)} Candles (1m)</b>\n{category} crossed 60% threshold"
+                                self.send_telegram_photo(chart_bytes, caption)
+                                                                
+                        else:
+                            print(f"Not enough data for 1m chart. Have {len(df_1m)} candles, need 5.")
         
         # Update previous probabilities
         self.previous_probs = current_probs.copy()
@@ -231,6 +447,27 @@ class MarketPredictor:
         
         return df
 
+    def load_model_if_valid(self, max_age_days=7):
+        """Load model if it exists and is younger than max_age_days"""
+        if not os.path.exists(MODEL_FILE):
+            return False
+            
+        try:
+            # Check file age
+            file_time = os.path.getmtime(MODEL_FILE)
+            file_age = datetime.now() - datetime.fromtimestamp(file_time)
+            
+            if file_age.days >= max_age_days:
+                print(f"Model found but too old ({file_age.days} days). Retraining...")
+                return False
+                
+            print(f"Loading saved model (Age: {file_age})...")
+            self.model = lgb.Booster(model_file=MODEL_FILE)
+            return True
+        except Exception as e:
+            print(f"Error loading model: {e}")
+            return False
+
     def train_model(self, df):
         print("Training model...")
         df = self.prepare_features(df)
@@ -279,6 +516,13 @@ class MarketPredictor:
         y_pred_class = [np.argmax(x) for x in y_pred]
         print(classification_report(y_test, y_pred_class))
         
+        # Save model
+        try:
+            self.model.save_model(MODEL_FILE)
+            print(f"Model saved to {MODEL_FILE}")
+        except Exception as e:
+            print(f"Failed to save model: {e}")
+            
         return self.model
 
     def on_message(self, ws, message):
@@ -307,7 +551,7 @@ class MarketPredictor:
         
         with self.lock:
             self.latest_data.append(data)
-            if len(self.latest_data) > 100: # Keep last 100 bars for feature calc
+            if len(self.latest_data) > 20000: # Keep last 20000 bars for feature calc and 15m resampling
                 self.latest_data.pop(0)
                 
             if len(self.latest_data) >= 20: # Need enough data for rolling features
@@ -332,17 +576,17 @@ class MarketPredictor:
                 confidence = probs[pred_class]
                 
                 # Display all prediction results with full probability distribution
-                print(f"\n{'='*80}")
-                print(f"[{timestamp}] LIVE PREDICTION")
-                print(f"{'='*80}")
-                print(f"Current Price: ${price:.2f}")
-                print(f"Order Flow Imbalance (OFI): {last_row['delta']:.2f}")
-                print(f"\nPrediction: {direction} (Confidence: {confidence:.2%})")
-                print(f"\nProbability Distribution:")
-                print(f"  - NEUTRAL: {probs[0]:.2%}")
-                print(f"  - PUMP:    {probs[1]:.2%}")
-                print(f"  - DUMP:    {probs[2]:.2%}")
-                print(f"{'='*80}\n")
+                # print(f"\n{'='*80}")
+                # print(f"[{timestamp}] LIVE PREDICTION")
+                # print(f"{'='*80}")
+                # print(f"Current Price: ${price:.2f}")
+                # print(f"Order Flow Imbalance (OFI): {last_row['delta']:.2f}")
+                # print(f"\nPrediction: {direction} (Confidence: {confidence:.2%})")
+                # print(f"\nProbability Distribution:")
+                # print(f"  - NEUTRAL: {probs[0]:.2%}")
+                # print(f"  - PUMP:    {probs[1]:.2%}")
+                # print(f"  - DUMP:    {probs[2]:.2%}")
+                # print(f"{'='*80}\n")
                 
                 # Send Telegram notifications if conditions are met
                 self.check_and_send_notifications(
@@ -363,43 +607,65 @@ class MarketPredictor:
     def on_open(self, ws):
         print("WebSocket Connection Opened")
 
-    def start_live_prediction(self):
+    def start_live_prediction(self, historical_data=None):
         if self.model is None:
             print("Model not trained! Cannot start live prediction.")
             return
 
         print("Starting live prediction...")
-        # Pre-fill buffer with some historical data so we don't wait too long for features
-        # (Optional, but good practice. For now we just wait for 20 bars from WS)
+        
+        # Pre-fill buffer with historical data
+        if historical_data is not None and not historical_data.empty:
+            # Convert to list of dicts and take last 20000
+            # Note: historical_data has datetime objects for start_ts, WS has strings.
+            # We'll handle this mixed type in check_and_send_notifications.
+            records = historical_data.to_dict('records')
+            # Ensure we don't exceed the buffer size we want to maintain
+            self.latest_data = records[-20000:]
+            print(f"Pre-filled buffer with {len(self.latest_data)} records from history.")
         
         websocket.enableTrace(False)
         ws_headers = {}
         if AUTH_TOKEN:
             ws_headers["Authorization"] = f"Bearer {AUTH_TOKEN}"
 
-        ws = websocket.WebSocketApp(WS_URL,
+        # Register signal handlers for systemd/OS signals
+        signal.signal(signal.SIGTERM, self.handle_exit)
+        signal.signal(signal.SIGINT, self.handle_exit)
+
+        self.ws = websocket.WebSocketApp(WS_URL,
                                   on_open=self.on_open,
                                   on_message=self.on_message,
                                   on_error=self.on_error,
                                   on_close=self.on_close,
                                   header=ws_headers)
 
-        ws.run_forever()
+        self.ws.run_forever()
 
 if __name__ == "__main__":
     predictor = MarketPredictor()
     
-    # 1. Fetch Data
-    df = predictor.fetch_historical_data(days=5)
+    # 1. Check for existing model
+    model_loaded = predictor.load_model_if_valid(max_age_days=50)
+    
+    # 2. Fetch Data
+    # If model is loaded, we just need enough data for the buffer (e.g. 2 days)
+    # If we need to train, we fetch more (e.g. 50 days)
+    days_to_fetch = 2 if model_loaded else 5
+    df = predictor.fetch_historical_data(days=days_to_fetch)
     
     if not df.empty and len(df) > 10:
-        # 2. Train Model
-        predictor.train_model(df)
+        # 3. Train Model if needed
+        if not model_loaded:
+            predictor.train_model(df)
         
-        # 3. Live Predict
+        # 4. Live Predict
         try:
-            predictor.start_live_prediction()
+            predictor.start_live_prediction(df)
         except KeyboardInterrupt:
             print("Stopping...")
+        except Exception as e:
+            print(f"Fatal error: {e}")
+            sys.exit(1) # Exit with error code so systemd knows it failed
     else:
-        print(f"Not enough data to train. Fetched {len(df)} records. Need > 10.")
+        print(f"Not enough data. Fetched {len(df)} records.")

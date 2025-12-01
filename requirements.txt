@@ -1,0 +1,7 @@
+pandas
+lightgbm
+requests
+websocket-client
+scikit-learn
+numpy
+python-dotenv

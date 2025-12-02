@@ -10,6 +10,7 @@ import io
 import os
 import sys
 import signal
+import logging
 from datetime import datetime, timedelta, timezone
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
@@ -18,6 +19,14 @@ import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend
 import matplotlib.pyplot as plt
 import mplfinance as mpf
+
+# Configure logging for systemd
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
@@ -70,7 +79,7 @@ class MarketPredictor:
         self.ws = None
 
     def handle_exit(self, signum, frame):
-        print(f"\nReceived signal {signum}. Exiting gracefully...")
+        logger.info(f"Received signal {signum}. Exiting gracefully...")
         if self.ws:
             self.ws.close()
         sys.exit(0)
@@ -78,7 +87,7 @@ class MarketPredictor:
     def send_telegram_message(self, message):
         """Send a message via Telegram Bot API"""
         if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-            print("Telegram credentials not configured. Skipping notification.")
+            logger.warning("Telegram credentials not configured. Skipping notification.")
             return False
         
         try:
@@ -90,16 +99,16 @@ class MarketPredictor:
             }
             response = requests.post(url, json=payload, timeout=10)
             response.raise_for_status()
-            print("Telegram message sent successfully.")
+            logger.info("Telegram message sent successfully.")
             return True
         except Exception as e:
-            print(f"Failed to send Telegram message: {e}")
+            logger.error(f"Failed to send Telegram message: {e}")
             return False
 
     def send_telegram_photo(self, photo_bytes, caption=""):
         """Send a photo via Telegram Bot API"""
         if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-            print("Telegram credentials not configured. Skipping photo.")
+            logger.warning("Telegram credentials not configured. Skipping photo.")
             return False
         
         try:
@@ -114,10 +123,10 @@ class MarketPredictor:
             }
             response = requests.post(url, files=files, data=data, timeout=30)
             response.raise_for_status()
-            print("Telegram photo sent successfully.")
+            logger.info("Telegram photo sent successfully.")
             return True
         except Exception as e:
-            print(f"Failed to send Telegram photo: {e}")
+            logger.error(f"Failed to send Telegram photo: {e}")
             return False
 
     def generate_candle_chart(self, df_20min, symbol):
@@ -150,7 +159,7 @@ class MarketPredictor:
             
             return buf.getvalue()
         except Exception as e:
-            print(f"Error generating candle chart: {e}")
+            logger.error(f"Error generating candle chart: {e}")
             return None
 
     def send_followup(self, symbol, category, trigger_price, trigger_time, label):
@@ -202,7 +211,7 @@ class MarketPredictor:
                 # Rename columns to match what generate_candle_chart expects if needed
                 # But generate_candle_chart expects 'start_ts' which we have after reset_index
                 
-                print(f"Generating {label} follow-up chart for {category}...")
+                logger.info(f"Generating {label} follow-up chart for {category}...")
                 chart_bytes = self.generate_candle_chart(df_chart_reset, symbol)
             
             # Calculate stats
@@ -225,13 +234,13 @@ class MarketPredictor:
                 self.send_telegram_message(message)
                 
         except Exception as e:
-            print(f"Error in follow-up for {symbol}: {e}")
+            logger.error(f"Error in follow-up for {symbol}: {e}")
         finally:
             # Reset flag if 2h
             if label == "2h":
                 with self.lock:
                     self.active_events[symbol][category] = False
-                    print(f"Reset active event for {category} on {symbol}")
+                    logger.info(f"Reset active event for {category} on {symbol}")
 
     def check_and_send_notifications(self, symbol, timestamp, price, delta, direction, confidence, probs):
         """Check if notifications should be sent based on threshold crossing or hourly schedule"""
@@ -263,7 +272,7 @@ class MarketPredictor:
             if prev_prob < threshold <= curr_prob:
                 # Check if event is already active
                 if self.active_events[symbol][category]:
-                    print(f"Skipping {category} alert for {symbol} - Timer already running.")
+                    logger.info(f"Skipping {category} alert for {symbol} - Timer already running.")
                     continue
                 
                 # Set active
@@ -325,7 +334,7 @@ class MarketPredictor:
                             # Reset index to make start_ts a column again for generate_candle_chart
                             df_chart = df_chart.reset_index()
                             
-                            print(f"Generating candle chart for {symbol} with {len(df_chart)} 1m candles...")
+                            logger.info(f"Generating candle chart for {symbol} with {len(df_chart)} 1m candles...")
                             chart_bytes = self.generate_candle_chart(df_chart, symbol)
                             
                             if chart_bytes:
@@ -333,7 +342,7 @@ class MarketPredictor:
                                 self.send_telegram_photo(chart_bytes, caption)
                                                                 
                         else:
-                            print(f"Not enough data for 1m chart for {symbol}. Have {len(df_1m)} candles, need 5.")
+                            logger.warning(f"Not enough data for 1m chart for {symbol}. Have {len(df_1m)} candles, need 5.")
         
         # Update previous probabilities for this symbol
         self.previous_probs[symbol] = current_probs.copy()
@@ -357,7 +366,7 @@ class MarketPredictor:
             self.last_hourly_message_time[symbol] = current_time
 
     def fetch_historical_data(self, symbols, days=3):
-        print(f"Fetching data for symbols {symbols} for the last {days} days in 3 requests...")
+        logger.info(f"Fetching data for symbols {symbols} for the last {days} days in 3 requests...")
         all_data = []
         end_time = datetime.now(timezone.utc)
         start_time = end_time - timedelta(days=days)
@@ -379,7 +388,7 @@ class MarketPredictor:
             }
             
             try:
-                print(f"Request {i+1}/3: Downloading data from {params['start']} to {params['end']}...")
+                logger.info(f"Request {i+1}/3: Downloading data from {params['start']} to {params['end']}...")
                 headers = {}
                 if AUTH_TOKEN:
                     headers["Authorization"] = f"Bearer {AUTH_TOKEN}"
@@ -399,19 +408,19 @@ class MarketPredictor:
                             item = json.loads(decoded_line)
                             all_data.append(item)
                         except json.JSONDecodeError as e:
-                            print(f"JSON decode error: {e}")
+                            logger.error(f"JSON decode error: {e}")
                             continue
                         
             except Exception as e:
-                print(f"Error fetching data: {e}")
+                logger.error(f"Error fetching data: {e}")
             
         df = pd.DataFrame(all_data)
         if not df.empty:
             df['start_ts'] = pd.to_datetime(df['start_ts'], format='ISO8601')
             df = df.sort_values('start_ts').reset_index(drop=True)
-            print(f"Total records fetched: {len(df)}")
+            logger.info(f"Total records fetched: {len(df)}")
         else:
-            print("No data fetched.")
+            logger.warning("No data fetched.")
             
         return df
 
@@ -481,25 +490,25 @@ class MarketPredictor:
             file_age = datetime.now() - datetime.fromtimestamp(file_time)
             
             if file_age.days >= max_age_days:
-                print(f"Model for {symbol} found but too old ({file_age.days} days). Retraining...")
+                logger.info(f"Model for {symbol} found but too old ({file_age.days} days). Retraining...")
                 return False
                 
-            print(f"Loading saved model for {symbol} (Age: {file_age})...")
+            logger.info(f"Loading saved model for {symbol} (Age: {file_age})...")
             self.models[symbol] = lgb.Booster(model_file=model_file)
             return True
         except Exception as e:
-            print(f"Error loading model for {symbol}: {e}")
+            logger.error(f"Error loading model for {symbol}: {e}")
             return False
 
     def train_model(self, symbol, df):
-        print(f"Training model for {symbol}...")
+        logger.info(f"Training model for {symbol}...")
         df = self.prepare_features(df)
         
         # Drop last rows with NaN targets
         df = df.dropna(subset=['target', 'future_return'] + self.feature_cols)
         
         if len(df) < 10:
-            print(f"Not enough data after feature engineering to train model for {symbol}. Rows: {len(df)}")
+            logger.warning(f"Not enough data after feature engineering to train model for {symbol}. Rows: {len(df)}")
             return None
 
         X = df[self.feature_cols]
@@ -509,7 +518,7 @@ class MarketPredictor:
         try:
             X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
         except ValueError as e:
-            print(f"Error splitting data for {symbol}: {e}")
+            logger.error(f"Error splitting data for {symbol}: {e}")
             return None
         
         train_data = lgb.Dataset(X_train, label=y_train)
@@ -537,15 +546,15 @@ class MarketPredictor:
         # Evaluate
         y_pred = model.predict(X_test)
         y_pred_class = [np.argmax(x) for x in y_pred]
-        print(classification_report(y_test, y_pred_class))
+        logger.info(f"Model evaluation:\n{classification_report(y_test, y_pred_class)}")
         
         # Save model
         model_file = self.get_model_file(symbol)
         try:
             model.save_model(model_file)
-            print(f"Model for {symbol} saved to {model_file}")
+            logger.info(f"Model for {symbol} saved to {model_file}")
         except Exception as e:
-            print(f"Failed to save model for {symbol}: {e}")
+            logger.error(f"Failed to save model for {symbol}: {e}")
         
         # Store in models dict
         self.models[symbol] = model
@@ -636,21 +645,21 @@ class MarketPredictor:
                 )
 
     def on_error(self, ws, error):
-        print(f"WebSocket Error: {error}")
+        logger.error(f"WebSocket Error: {error}")
 
     def on_close(self, ws, close_status_code, close_msg):
-        print(f"WebSocket Closed. Code: {close_status_code}, Msg: {close_msg}")
+        logger.info(f"WebSocket Closed. Code: {close_status_code}, Msg: {close_msg}")
 
     def on_open(self, ws):
-        print("WebSocket Connection Opened")
+        logger.info("WebSocket Connection Opened")
 
     def start_live_prediction(self, historical_data=None):
         # Check if at least one model is trained
         if not self.models or all(model is None for model in self.models.values()):
-            print("No models trained! Cannot start live prediction.")
+            logger.error("No models trained! Cannot start live prediction.")
             return
 
-        print("Starting live prediction...")
+        logger.info("Starting live prediction...")
         
         # Pre-fill buffer with historical data per symbol
         if historical_data is not None and not historical_data.empty:
@@ -664,7 +673,7 @@ class MarketPredictor:
                     records = symbol_data.to_dict('records')
                     # Ensure we don't exceed the buffer size we want to maintain
                     self.latest_data[symbol.upper()] = records[-20000:]
-                    print(f"Pre-filled buffer for {symbol.upper()} with {len(self.latest_data[symbol.upper()])} records from history.")
+                    logger.info(f"Pre-filled buffer for {symbol.upper()} with {len(self.latest_data[symbol.upper()])} records from history.")
         
         websocket.enableTrace(False)
         ws_headers = {}
@@ -688,7 +697,7 @@ class MarketPredictor:
         self.ws.run_forever()
 
 if __name__ == "__main__":
-    print(f"Initializing Market Predictor for symbols: {SYMBOLS}")
+    logger.info(f"Initializing Market Predictor for symbols: {SYMBOLS}")
     predictor = MarketPredictor(SYMBOLS)
     
     # 1. Check for existing models and load them
@@ -696,9 +705,9 @@ if __name__ == "__main__":
     for symbol in SYMBOLS:
         models_loaded[symbol] = predictor.load_model_if_valid(symbol, max_age_days=50)
         if models_loaded[symbol]:
-            print(f"✓ Model loaded for {symbol}")
+            logger.info(f"✓ Model loaded for {symbol}")
         else:
-            print(f"✗ Model not found or too old for {symbol}")
+            logger.info(f"✗ Model not found or too old for {symbol}")
     
     # 2. Fetch Data
     # If all models are loaded, we just need enough data for the buffer (e.g. 2 days)
@@ -706,29 +715,29 @@ if __name__ == "__main__":
     all_models_loaded = all(models_loaded.values())
     days_to_fetch = 2 if all_models_loaded else 5
     
-    print(f"\nFetching {days_to_fetch} days of historical data...")
+    logger.info(f"Fetching {days_to_fetch} days of historical data...")
     df = predictor.fetch_historical_data(SYMBOLS, days=days_to_fetch)
     
     if not df.empty and len(df) > 10:
         # 3. Train Models if needed (per symbol)
         for symbol in SYMBOLS:
             if not models_loaded[symbol]:
-                print(f"\nTraining model for {symbol.upper()}...")
+                logger.info(f"Training model for {symbol.upper()}...")
                 # Filter data for this symbol
                 symbol_df = df[df['symbol'] == symbol.upper()].copy()
                 if len(symbol_df) > 10:
                     predictor.train_model(symbol.upper(), symbol_df)
-                    print(f"✓ Model trained for {symbol.upper()}")
+                    logger.info(f"✓ Model trained for {symbol.upper()}")
                 else:
-                    print(f"✗ Not enough data for {symbol.upper()}. Skipping training.")
+                    logger.warning(f"✗ Not enough data for {symbol.upper()}. Skipping training.")
         
         # 4. Live Predict
         try:
             predictor.start_live_prediction(df)
         except KeyboardInterrupt:
-            print("Stopping...")
+            logger.info("Stopping...")
         except Exception as e:
-            print(f"Fatal error: {e}")
+            logger.error(f"Fatal error: {e}")
             sys.exit(1) # Exit with error code so systemd knows it failed
     else:
-        print(f"Not enough data. Fetched {len(df)} records.")
+        logger.warning(f"Not enough data. Fetched {len(df)} records.")

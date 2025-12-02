@@ -72,7 +72,7 @@ class MarketPredictor:
         self.latest_data = {}  # symbol -> list of data
         self.lock = threading.RLock()
 
-        self.send_hourly_message = False
+        self.send_hourly_message = True
 
         self.PROB_THRESHOLD = 40.0  # If Pump/Dump > 40%, pay attention (even if Neutral is 50%)
         self.OFI_THRESHOLD = 0.5  # Minimum OFI strength to confirm the move
@@ -101,6 +101,8 @@ class MarketPredictor:
             self.lstm_prediction_counters[symbol] = 0
             self.last_lstm_predictions[symbol] = {'direction': 'N/A', 'probs': [0.0, 0.0, 0.0], 'pred_class': -1}
         
+        self.market_regime = {} # Stores global market state (season, etc.)
+        self.prediction_history = {s: [] for s in self.symbols} # Stores last N predictions for averaging
         self.initial_message_sent = False
         self.ENABLE_LSTM = True # Set to True to enable LSTM training
         self.ws = None
@@ -230,13 +232,14 @@ class MarketPredictor:
         if alerts is None:
             alerts = []
             
-        # Build aggregated message
-        message = f"{title}\n\n"
+        # Send title as separate message
+        self.send_telegram_message(f"<b>{title}</b>")
         
         # Iterate over ALL symbols to build the message
         for sym in self.symbols:
             pred_data = self.last_prediction_data.get(sym)
             if pred_data:
+                sym_msg = ""
                 # Get emoji for prediction direction
                 direction_emoji = ""
                 if pred_data['direction'] == "PUMP":
@@ -251,14 +254,17 @@ class MarketPredictor:
                 
                 # Add header with alert indicator
                 if crossed:
-                    message += f"⚠️ <b>{sym.upper()} (ALERT: {', '.join(crossed)})</b>\n"
+                    sym_msg += f"⚠️ <b><u>{sym.upper()}</u> (ALERT: {', '.join(crossed)})</b>\n"
                 else:
-                    message += f"<b>{sym.upper()}</b>\n"
-                
-                message += f"Price: ${pred_data['price']:.2f}\n"
-                message += f"OFI: {pred_data['delta']:.2f}\n"
-                message += f"LGBM: <b>{direction_emoji} {pred_data['direction']}</b> ({pred_data['confidence']:.2%})\n"
-                
+                    sym_msg += f"<b><u>{sym.upper()}</u></b>\n"
+
+                sym_msg += f"Price: <code>${pred_data['price']:.2f}</code>\n"
+                sym_msg += f"OFI: <code>{pred_data['delta']:.2f}</code>\n"
+                sym_msg += f"<b>LGBM:</b> {direction_emoji} <b>{pred_data['direction']}</b> ({pred_data['confidence']:.2%})\n"
+                sym_msg += f"• NEUTRAL: <code>{pred_data['probs']['NEUTRAL']:.2%}</code>\n"
+                sym_msg += f"• PUMP: <code>{pred_data['probs']['PUMP']:.2%}</code>\n"
+                sym_msg += f"• DUMP: <code>{pred_data['probs']['DUMP']:.2%}</code>\n"
+
                 if pred_data.get('lstm_direction') and pred_data['lstm_direction'] != "N/A":
                     l_emoji = ""
                     if pred_data['lstm_direction'] == "PUMP":
@@ -267,33 +273,22 @@ class MarketPredictor:
                         l_emoji = "📉"
                     elif pred_data['lstm_direction'] == "NEUTRAL":
                         l_emoji = "➖"
-                    message += f"LSTM: <b>{l_emoji} {pred_data['lstm_direction']}</b> ({pred_data['lstm_confidence']:.2%})\n"
+                    sym_msg += f"\n<b>LSTM:</b> {l_emoji} <b>{pred_data['lstm_direction']}</b> ({pred_data['lstm_confidence']:.2%})\n"
+
+                    # Add LSTM probabilities if available
+                    if 'lstm_probs' in pred_data:
+                        lp = pred_data['lstm_probs']
+                        sym_msg += f"• NEUTRAL: <code>{lp['NEUTRAL']:.2%}</code>\n"
+                        sym_msg += f"• PUMP: <code>{lp['PUMP']:.2%}</code>\n"
+                        sym_msg += f"• DUMP: <code>{lp['DUMP']:.2%}</code>\n"
                 
-                message += f"Probabilities:\n"
-                message += f"NEUTRAL: {pred_data['probs']['NEUTRAL']:.2%}\n"
-                message += f"PUMP: {pred_data['probs']['PUMP']:.2%}\n"
-                message += f"DUMP: {pred_data['probs']['DUMP']:.2%}\n"
-                message += "\n"
-        
-        # Generate chart
-        chart_bytes = None
-        target_symbol = None
-        
-        if alerts:
-            # If alerts exist, chart the first alerted symbol
-            # alerts is list of (symbol, category)
-            target_symbol = alerts[0][0]
-        elif self.symbols:
-            # If no alerts (e.g. initial message), chart the first configured symbol
-            target_symbol = self.symbols[0]
-            
-        if target_symbol:
-            chart_bytes = self.generate_latest_chart(target_symbol)
-            
-        if chart_bytes:
-            self.send_telegram_photo(chart_bytes, message)
-        else:
-            self.send_telegram_message(message)
+                # Generate chart for THIS symbol
+                chart_bytes = self.generate_latest_chart(sym)
+                
+                if chart_bytes:
+                    self.send_telegram_photo(chart_bytes, sym_msg)
+                else:
+                    self.send_telegram_message(sym_msg)
 
     def send_batched_alerts(self):
         """Send a single aggregated message for all pending threshold crossing alerts"""
@@ -1026,13 +1021,23 @@ class MarketPredictor:
                     },
                     'pred_class': int(pred_class),
                     'lstm_direction': lstm_direction,
-                    'lstm_confidence': float(lstm_probs[lstm_pred_class]) if lstm_direction != "N/A" else 0.0
+                    'lstm_confidence': float(lstm_probs[lstm_pred_class]) if lstm_direction != "N/A" else 0.0,
+                    'lstm_probs': {
+                        'NEUTRAL': float(lstm_probs[0]),
+                        'PUMP': float(lstm_probs[1]),
+                        'DUMP': float(lstm_probs[2])
+                        } if lstm_direction != "N/A" else {'NEUTRAL': 0.0, 'PUMP': 0.0, 'DUMP': 0.0}
                 }
+
+                # Add to history for averaging (keep last 20)
+                self.prediction_history[symbol].append(self.last_prediction_data[symbol])
+                if len(self.prediction_history[symbol]) > 20:
+                    self.prediction_history[symbol].pop(0)
 
                 # Display all prediction results with full probability distribution
                 lstm_info = ""
                 if lstm_direction != "N/A":
-                    lstm_info = f" | LSTM: {lstm_direction} ({lstm_probs[lstm_pred_class]:.2%})"
+                    lstm_info = f" | LSTM: {lstm_direction} ({lstm_probs[lstm_pred_class]:.2%}) [N:{lstm_probs[0]:.0%} P:{lstm_probs[1]:.0%} D:{lstm_probs[2]:.0%}]"
                     
                 logger.info(
                     f"{symbol.upper()} | Price: ${price:.2f} | OFI: {last_row['delta']:.2f} | LGBM: {direction} ({confidence:.2%}){lstm_info} | NEUTRAL: {probs[0]:.2%} | PUMP: {probs[1]:.2%} | DUMP: {probs[2]:.2%}")
@@ -1055,6 +1060,165 @@ class MarketPredictor:
                     confidence=confidence,
                     probs=probs
                 )
+                
+                # Update Market Regime Analysis
+                self.analyze_market_regime()
+
+    def analyze_market_regime(self):
+        """
+        Analyze the current market regime (BTC Season vs Alt Season) based on all symbols.
+        Stores the result in self.market_regime.
+        """
+        # Need data for all symbols to make a global decision
+        if not all(self.last_prediction_data.get(s) for s in self.symbols):
+            return
+
+        btc_data = self.last_prediction_data.get('btcusdt')
+        eth_data = self.last_prediction_data.get('ethusdt')
+        sol_data = self.last_prediction_data.get('solusdt')
+        
+        # If we don't have specific symbols, try to infer from what we have
+        # Assuming 'btcusdt' is always present as the anchor
+        if not btc_data:
+            return
+
+        alts_data = [self.last_prediction_data[s] for s in self.symbols if s != 'btcusdt']
+        
+        if not alts_data:
+            self.market_regime = {"season": "BTC_ONLY", "confidence": 0.0, "details": "Only BTC data available"}
+            return
+
+        # Metrics
+        avg_alt_ofi = np.mean([d['delta'] for d in alts_data])
+        
+        # --- NEW LOGIC: Use Average of Last 20 Predictions ---
+        # Instead of just current snapshot, let's calculate the average probabilities over the last 20 ticks
+        # This smooths out noise and gives a more robust "regime" signal.
+        
+        # Helper to get average metrics for a symbol from history
+        def get_avg_metrics(sym):
+            history = self.prediction_history.get(sym, [])
+            if not history:
+                return None
+            
+            # Calculate means
+            mean_pump = np.mean([item['probs']['PUMP'] for item in history])
+            mean_dump = np.mean([item['probs']['DUMP'] for item in history])
+            mean_ofi = np.mean([item['delta'] for item in history])
+            
+            return {
+                'pump': mean_pump,
+                'dump': mean_dump,
+                'ofi': mean_ofi
+            }
+
+        # Calculate averages for BTC
+        btc_avgs = get_avg_metrics('btcusdt')
+        if btc_avgs:
+            btc_pump_prob = btc_avgs['pump']
+            btc_dump_prob = btc_avgs['dump']
+            btc_ofi = btc_avgs['ofi']
+        
+        # Calculate averages for Alts (aggregate of all alt histories)
+        alt_pump_probs = []
+        alt_dump_probs = []
+        alt_ofis = []
+        
+        for s in self.symbols:
+            if s != 'btcusdt':
+                avgs = get_avg_metrics(s)
+                if avgs:
+                    alt_pump_probs.append(avgs['pump'])
+                    alt_dump_probs.append(avgs['dump'])
+                    alt_ofis.append(avgs['ofi'])
+        
+        if alt_pump_probs:
+            avg_alt_pump_prob = np.mean(alt_pump_probs)
+            avg_alt_dump_prob = np.mean(alt_dump_probs)
+            avg_alt_ofi = np.mean(alt_ofis)
+        
+        # Determine Season
+        
+        # Determine Season
+        season = "NEUTRAL"
+        confidence = 0.0
+        details = ""
+        
+        # 1. BEAR MARKET: Everything is dumping
+        if btc_dump_prob > 0.5 and avg_alt_dump_prob > 0.5:
+            season = "BEAR_MARKET"
+            confidence = (btc_dump_prob + avg_alt_dump_prob) / 2
+            details = "Global sell-off detected."
+            
+        # 2. BULL MARKET: Everything is pumping
+        elif btc_pump_prob > 0.5 and avg_alt_pump_prob > 0.5:
+            season = "BULL_MARKET"
+            confidence = (btc_pump_prob + avg_alt_pump_prob) / 2
+            details = "Global rally detected."
+            
+        # 3. BTC SEASON: BTC is strong, Alts are weak/neutral
+        elif btc_pump_prob > avg_alt_pump_prob + 0.1:
+            season = "BTC_SEASON"
+            confidence = btc_pump_prob - avg_alt_pump_prob
+            details = f"BTC leading (Pump Prob: {btc_pump_prob:.2f} vs Alts: {avg_alt_pump_prob:.2f})"
+            
+        # 4. ALT SEASON: Alts are strong, BTC is stable/weak (but not dumping hard)
+        elif avg_alt_pump_prob > btc_pump_prob + 0.1 and btc_dump_prob < 0.6:
+            season = "ALT_SEASON"
+            confidence = avg_alt_pump_prob - btc_pump_prob
+            details = f"Alts leading (Avg Pump Prob: {avg_alt_pump_prob:.2f} vs BTC: {btc_pump_prob:.2f})"
+            
+        # 5. DIVERGENCE: BTC Dumping, Alts Pumping (Rare/Risky)
+        elif btc_dump_prob > 0.6 and avg_alt_pump_prob > 0.5:
+            season = "DIVERGENCE_RISK"
+            confidence = (btc_dump_prob + avg_alt_pump_prob) / 2
+            details = "BTC dumping while Alts pump. High risk."
+            
+        # Check for change
+        previous_season = self.market_regime.get("season", "NEUTRAL")
+        
+        # Store state
+        self.market_regime = {
+            "season": season,
+            "confidence": confidence,
+            "details": details,
+            "metrics": {
+                "btc_pump": btc_pump_prob,
+                "alt_pump": avg_alt_pump_prob,
+                "btc_ofi": btc_ofi,
+                "alt_ofi": avg_alt_ofi
+            },
+            "timestamp": datetime.now()
+        }
+        
+        # Log significant changes
+        if season != previous_season:
+            logger.info(f"Market Regime Change: {previous_season} -> {season} ({confidence:.2%}) - {details}")
+            # Send Telegram notification for season change
+            msg = f"🔄 <b>Market Regime Change</b>\n\n"
+            msg += f"Old: {previous_season}\n"
+            msg += f"New: <b>{season}</b>\n"
+            msg += f"Confidence: {confidence:.2%}\n"
+            msg += f"Details: {details}\n"
+            self.send_telegram_message(msg)
+        
+        # Check for midnight report (once per day)
+        current_time = datetime.now()
+        last_midnight = self.market_regime.get("last_midnight_report")
+        
+        # If it's between 00:00 and 00:05 and we haven't sent it today
+        if 0 <= current_time.hour < 1 and current_time.minute < 5:
+            # Check if we already sent it today
+            if last_midnight is None or last_midnight.day != current_time.day:
+                logger.info("Sending midnight market regime report...")
+                msg = f"🌙 <b>Daily Market Regime Report</b>\n\n"
+                msg += f"Current Season: <b>{season}</b>\n"
+                msg += f"Confidence: {confidence:.2%}\n"
+                msg += f"Details: {details}\n"
+                self.send_telegram_message(msg)
+                
+                # Update last report time in the dictionary (preserving other keys)
+                self.market_regime["last_midnight_report"] = current_time
 
     def on_error(self, ws, error):
         logger.error(f"WebSocket Error: {error}")
@@ -1101,6 +1265,37 @@ class MarketPredictor:
                             
                             direction_map = {0: "NEUTRAL", 1: "PUMP", 2: "DUMP"}
                             
+                            # Predict (LSTM) if available
+                            lstm_pred_class = -1
+                            lstm_probs = [0.0, 0.0, 0.0]
+                            lstm_direction = "N/A"
+                            
+                            if self.ENABLE_LSTM and symbol in self.lstm_models and symbol in self.lstm_scalers:
+                                try:
+                                    # Need last 200 rows for LSTM
+                                    if len(df) >= 200:
+                                        lstm_input_df = df.iloc[-200:]
+                                        lstm_features = lstm_input_df[self.feature_cols].values
+                                        # Scale
+                                        lstm_scaled = self.lstm_scalers[symbol].transform(lstm_features)
+                                        # Reshape to (1, 200, n_features)
+                                        lstm_input = lstm_scaled.reshape(1, 200, lstm_scaled.shape[1])
+                                        
+                                        lstm_prediction = self.lstm_models[symbol].predict(lstm_input, verbose=0)
+                                        lstm_pred_class = np.argmax(lstm_prediction[0])
+                                        lstm_probs = lstm_prediction[0]
+                                        
+                                        lstm_direction = direction_map[lstm_pred_class]
+                                        
+                                        # Update cache
+                                        self.last_lstm_predictions[symbol] = {
+                                            'direction': lstm_direction,
+                                            'probs': lstm_probs,
+                                            'pred_class': lstm_pred_class
+                                        }
+                                except Exception as e:
+                                    logger.error(f"Initial LSTM prediction error for {symbol}: {e}")
+                            
                             self.last_prediction_data[symbol] = {
                                 'timestamp': last_row['start_ts'],
                                 'price': last_row['close'],
@@ -1112,7 +1307,14 @@ class MarketPredictor:
                                     'PUMP': float(probs[1]),
                                     'DUMP': float(probs[2])
                                 },
-                                'pred_class': int(pred_class)
+                                'pred_class': int(pred_class),
+                                'lstm_direction': lstm_direction,
+                                'lstm_confidence': float(lstm_probs[lstm_pred_class]) if lstm_direction != "N/A" else 0.0,
+                                'lstm_probs': {
+                                    'NEUTRAL': float(lstm_probs[0]),
+                                    'PUMP': float(lstm_probs[1]),
+                                    'DUMP': float(lstm_probs[2])
+                                } if lstm_direction != "N/A" else {'NEUTRAL': 0.0, 'PUMP': 0.0, 'DUMP': 0.0}
                             }
                         except Exception as e:
                             logger.error(f"Error running initial prediction for {symbol}: {e}")

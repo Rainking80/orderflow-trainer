@@ -19,6 +19,10 @@ import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend
 import matplotlib.pyplot as plt
 import mplfinance as mpf
+import tensorflow as tf
+import tensorflow as tf
+from sklearn.preprocessing import MinMaxScaler
+import joblib
 
 # Configure logging for systemd
 logging.basicConfig(
@@ -52,23 +56,34 @@ class MarketPredictor:
         """
         self.symbols = symbols
         self.models = {}  # symbol -> model
+        self.lstm_models = {} # symbol -> lstm model
+        self.lstm_scalers = {} # symbol -> scaler
+        self.lstm_prediction_counters = {} # symbol -> int
+        self.last_lstm_predictions = {} # symbol -> dict
         self.feature_cols = [
             'delta', 'delta_pct', 'total_volume', 'trade_count', 
             'buy_volume', 'sell_volume', 'vwap', 'price_range',
             'large_trade_dominance', 'ratio_buy_sell_trades',
-            'rsi', 'volatility', 'return'
+            'rsi', 'volatility', 'return',
+            'ofi_sum_10s', 'ofi_sum_60s', 'ofi_sum_300s',
+            'ofi_lag_1', 'ofi_lag_2', 'ofi_lag_3', 'ofi_lag_5'
         ]
         self.running = False
         self.latest_data = {}  # symbol -> list of data
         self.lock = threading.RLock()
 
         self.send_hourly_message = False
+
+        self.PROB_THRESHOLD = 40.0  # If Pump/Dump > 40%, pay attention (even if Neutral is 50%)
+        self.OFI_THRESHOLD = 0.5  # Minimum OFI strength to confirm the move
+        self.CONSECUTIVE_SIGNAL_THRESHOLD = 3  # Number of consecutive signals required to trigger
         
         # Telegram notification tracking per symbol
         self.previous_probs = {}  # symbol -> {'NEUTRAL': 0.0, 'PUMP': 0.0, 'DUMP': 0.0}
         self.last_hourly_message_time = None  # Global timestamp for hourly updates
         self.last_prediction_data = {}  # symbol -> prediction dict
         self.active_events = {}  # symbol -> {'NEUTRAL': False, 'PUMP': False, 'DUMP': False}
+        self.signal_counters = {}  # symbol -> {'type': 'WAIT', 'count': 0}
         self.last_nightly_chart_time = None  # Track last nightly chart generation
         
         # Batching for threshold crossing alerts
@@ -82,8 +97,12 @@ class MarketPredictor:
             self.previous_probs[symbol] = {'NEUTRAL': 0.0, 'PUMP': 0.0, 'DUMP': 0.0}
             self.last_prediction_data[symbol] = None
             self.active_events[symbol] = {'NEUTRAL': False, 'PUMP': False, 'DUMP': False}
+            self.signal_counters[symbol] = {'type': 'WAIT', 'count': 0}
+            self.lstm_prediction_counters[symbol] = 0
+            self.last_lstm_predictions[symbol] = {'direction': 'N/A', 'probs': [0.0, 0.0, 0.0], 'pred_class': -1}
         
         self.initial_message_sent = False
+        self.ENABLE_LSTM = True # Set to True to enable LSTM training
         self.ws = None
 
     def handle_exit(self, signum, frame):
@@ -238,7 +257,18 @@ class MarketPredictor:
                 
                 message += f"Price: ${pred_data['price']:.2f}\n"
                 message += f"OFI: {pred_data['delta']:.2f}\n"
-                message += f"Prediction: <b>{direction_emoji} {pred_data['direction']}</b> ({pred_data['confidence']:.2%})\n"
+                message += f"LGBM: <b>{direction_emoji} {pred_data['direction']}</b> ({pred_data['confidence']:.2%})\n"
+                
+                if pred_data.get('lstm_direction') and pred_data['lstm_direction'] != "N/A":
+                    l_emoji = ""
+                    if pred_data['lstm_direction'] == "PUMP":
+                        l_emoji = "🚀"
+                    elif pred_data['lstm_direction'] == "DUMP":
+                        l_emoji = "📉"
+                    elif pred_data['lstm_direction'] == "NEUTRAL":
+                        l_emoji = "➖"
+                    message += f"LSTM: <b>{l_emoji} {pred_data['lstm_direction']}</b> ({pred_data['lstm_confidence']:.2%})\n"
+                
                 message += f"Probabilities:\n"
                 message += f"NEUTRAL: {pred_data['probs']['NEUTRAL']:.2%}\n"
                 message += f"PUMP: {pred_data['probs']['PUMP']:.2%}\n"
@@ -371,8 +401,6 @@ class MarketPredictor:
         
         # Note: Prediction data is now stored in on_message method before calling this function
         
-        # Check for 60% threshold crossing from below for each category
-        threshold = 0.60
         current_probs = {
             'NEUTRAL': probs[0],
             'PUMP': probs[1],
@@ -382,17 +410,24 @@ class MarketPredictor:
         # Track which symbols crossed thresholds in this call
         symbols_with_alerts = []
         
-        for category in ['NEUTRAL', 'PUMP', 'DUMP']:
-            prev_prob = self.previous_probs[symbol][category]
-            curr_prob = current_probs[category]
+        # Check for triggers using new logic
+        # Convert probs to percentage for threshold check
+        prob_pump_pct = probs[1] * 100
+        prob_dump_pct = probs[2] * 100
+        
+        trigger = self.check_for_trigger(symbol, prob_pump_pct, prob_dump_pct, delta)
+        
+        category = None
+        if trigger == "LONG_ENTRY":
+            category = "PUMP"
+        elif trigger == "SHORT_ENTRY":
+            category = "DUMP"
             
-            # Check if crossed 60% threshold from below
-            if prev_prob < threshold <= curr_prob:
-                # Check if event is already active
-                if self.active_events[symbol][category]:
-                    logger.info(f"Skipping {category} alert for {symbol} - Timer already running.")
-                    continue
-                
+        if category:
+            # Check if event is already active
+            if self.active_events[symbol][category]:
+                logger.info(f"Skipping {category} alert for {symbol} - Timer already running.")
+            else:
                 # Set active
                 self.active_events[symbol][category] = True
                 
@@ -623,6 +658,33 @@ class MarketPredictor:
         df['volatility'] = df['return'].rolling(window=20).std()
         df['rsi'] = self.calculate_rsi(df['close'])
         
+        # Ensure start_ts is datetime for time-based rolling
+        if 'start_ts' in df.columns:
+            df['start_ts'] = pd.to_datetime(df['start_ts'], format='mixed')
+            
+            # Set index to start_ts for time-based rolling, but keep it as column
+            # We sort just in case, though data should be sorted
+            df = df.sort_values('start_ts')
+            temp_index = pd.DatetimeIndex(df['start_ts'])
+            
+            # A. Rolling Sum (Accumulation)
+            # Sum of OFI (delta) over last N seconds
+            # We use the temp_index for rolling
+            df['ofi_sum_10s'] = df.set_index(temp_index)['delta'].rolling('10s').sum().values
+            df['ofi_sum_60s'] = df.set_index(temp_index)['delta'].rolling('60s').sum().values
+            df['ofi_sum_300s'] = df.set_index(temp_index)['delta'].rolling('300s').sum().values
+            
+            # B. Lag Features (The "Shape" of the move)
+            # Previous values of OFI
+            df['ofi_lag_1'] = df['delta'].shift(1)
+            df['ofi_lag_2'] = df['delta'].shift(2)
+            df['ofi_lag_3'] = df['delta'].shift(3)
+            df['ofi_lag_5'] = df['delta'].shift(5)
+        else:
+            # Fallback if no start_ts (should not happen in main flow)
+            for col in ['ofi_sum_10s', 'ofi_sum_60s', 'ofi_sum_300s', 'ofi_lag_1', 'ofi_lag_2', 'ofi_lag_3', 'ofi_lag_5']:
+                df[col] = 0
+
         # Fill NaNs
         df = df.fillna(0)
         
@@ -657,7 +719,7 @@ class MarketPredictor:
 
     def get_model_file(self, symbol):
         """Get model filename for a specific symbol"""
-        return f"lgb_model_{symbol}.txt"
+        return f"lgb_model_{symbol}_v2.txt"
     
     def load_model_if_valid(self, symbol, max_age_days=7):
         """Load model for a symbol if it exists and is younger than max_age_days"""
@@ -741,6 +803,109 @@ class MarketPredictor:
         self.models[symbol] = model
         return model
 
+    def get_lstm_model_file(self, symbol):
+        return f"lstm_model_{symbol}.keras"
+
+    def get_lstm_scaler_file(self, symbol):
+        return f"lstm_scaler_{symbol}.pkl"
+
+    def load_lstm_model_if_valid(self, symbol, max_age_days=3):
+        """Load LSTM model and scaler if valid"""
+        if not self.ENABLE_LSTM:
+            return False
+            
+        model_file = self.get_lstm_model_file(symbol)
+        scaler_file = self.get_lstm_scaler_file(symbol)
+        
+        if not os.path.exists(model_file) or not os.path.exists(scaler_file):
+            return False
+            
+        try:
+            # Check file age
+            file_time = os.path.getmtime(model_file)
+            file_age = datetime.now() - datetime.fromtimestamp(file_time)
+            
+            if file_age.days >= max_age_days:
+                logger.info(f"LSTM Model for {symbol} found but too old ({file_age.days} days). Retraining...")
+                return False
+                
+            logger.info(f"Loading saved LSTM model for {symbol} (Age: {file_age})...")
+            self.lstm_models[symbol] = tf.keras.models.load_model(model_file)
+            self.lstm_scalers[symbol] = joblib.load(scaler_file)
+            return True
+        except Exception as e:
+            logger.error(f"Error loading LSTM model for {symbol}: {e}")
+            return False
+
+    def train_lstm_model(self, symbol, df):
+        """Train an LSTM model for the given symbol"""
+        if not self.ENABLE_LSTM:
+            return
+
+        logger.info(f"Training LSTM model for {symbol}...")
+        
+        try:
+            # Prepare data
+            df = self.prepare_features(df)
+            df = df.dropna(subset=['target'] + self.feature_cols)
+            
+            if len(df) < 200:
+                logger.warning(f"Not enough data for LSTM training for {symbol}. Need at least 200 rows.")
+                return
+
+            # Scale features
+            scaler = MinMaxScaler()
+            feature_data = df[self.feature_cols].values
+            scaled_data = scaler.fit_transform(feature_data)
+            
+            # Save scaler
+            scaler_path = self.get_lstm_scaler_file(symbol)
+            joblib.dump(scaler, scaler_path)
+            self.lstm_scalers[symbol] = scaler
+            
+            # Prepare sequences
+            SEQ_LEN = 200
+            X = []
+            y = []
+            
+            targets = df['target'].values
+            
+            for i in range(SEQ_LEN, len(scaled_data)):
+                X.append(scaled_data[i-SEQ_LEN:i])
+                y.append(targets[i])
+                
+            X = np.array(X)
+            y = np.array(y)
+            
+            # Split data
+            train_size = int(len(X) * 0.8)
+            X_train, X_test = X[:train_size], X[train_size:]
+            y_train, y_test = y[:train_size], y[train_size:]
+            
+            # Build model
+            model = tf.keras.Sequential([
+                tf.keras.layers.LSTM(50, return_sequences=True, input_shape=(X_train.shape[1], X_train.shape[2])),
+                tf.keras.layers.Dropout(0.2),
+                tf.keras.layers.LSTM(50, return_sequences=False),
+                tf.keras.layers.Dropout(0.2),
+                tf.keras.layers.Dense(25, activation='relu'),
+                tf.keras.layers.Dense(3, activation='softmax')
+            ])
+            
+            model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+            
+            # Train
+            model.fit(X_train, y_train, batch_size=64, epochs=5, validation_data=(X_test, y_test), verbose=1)
+            
+            # Save
+            model_path = self.get_lstm_model_file(symbol)
+            model.save(model_path)
+            self.lstm_models[symbol] = model
+            logger.info(f"LSTM model for {symbol} saved to {model_path}")
+            
+        except Exception as e:
+            logger.error(f"Error training LSTM for {symbol}: {e}")
+
     def on_message(self, ws, message):
         # Skip empty or non-string messages
         if not message or not isinstance(message, (str, bytes)):
@@ -776,8 +941,11 @@ class MarketPredictor:
             if len(self.latest_data[symbol]) > 20000: # Keep last 20000 bars for feature calc and 15m resampling
                 self.latest_data[symbol].pop(0)
                 
-            if len(self.latest_data[symbol]) >= 20: # Need enough data for rolling features
-                df = pd.DataFrame(self.latest_data[symbol])
+            if len(self.latest_data[symbol]) >= 200: # Need enough data for rolling features and LSTM
+                # Optimize: Only take last 300 rows for feature calculation to avoid processing 20k rows every ms
+                # We need at least 200 for LSTM + some buffer for rolling window calculations
+                recent_data = self.latest_data[symbol][-300:]
+                df = pd.DataFrame(recent_data)
                 df = self.prepare_features(df) # This adds features to all rows
                 
                 # Get last row
@@ -787,11 +955,54 @@ class MarketPredictor:
                 if symbol not in self.models or self.models[symbol] is None:
                     return
                 
-                # Predict
+                # Predict (LightGBM)
                 features = last_row[self.feature_cols].values.reshape(1, -1)
                 prediction = self.models[symbol].predict(features)
                 pred_class = np.argmax(prediction[0])
                 probs = prediction[0]
+                
+                # Predict (LSTM) if available
+                lstm_pred_class = -1
+                lstm_probs = [0.0, 0.0, 0.0]
+                lstm_direction = "N/A"
+                
+                # Throttle LSTM: Run only every 10th message
+                self.lstm_prediction_counters[symbol] += 1
+                should_run_lstm = (self.lstm_prediction_counters[symbol] % 10 == 0)
+                
+                if self.ENABLE_LSTM and symbol in self.lstm_models and symbol in self.lstm_scalers:
+                    if should_run_lstm:
+                        try:
+                            # Need last 200 rows for LSTM
+                            if len(df) >= 200:
+                                lstm_input_df = df.iloc[-200:]
+                                lstm_features = lstm_input_df[self.feature_cols].values
+                                # Scale
+                                lstm_scaled = self.lstm_scalers[symbol].transform(lstm_features)
+                                # Reshape to (1, 200, n_features)
+                                lstm_input = lstm_scaled.reshape(1, 200, lstm_scaled.shape[1])
+                                
+                                lstm_prediction = self.lstm_models[symbol].predict(lstm_input, verbose=0)
+                                lstm_pred_class = np.argmax(lstm_prediction[0])
+                                lstm_probs = lstm_prediction[0]
+                                
+                                direction_map = {0: "NEUTRAL", 1: "PUMP", 2: "DUMP"}
+                                lstm_direction = direction_map[lstm_pred_class]
+                                
+                                # Update cache
+                                self.last_lstm_predictions[symbol] = {
+                                    'direction': lstm_direction,
+                                    'probs': lstm_probs,
+                                    'pred_class': lstm_pred_class
+                                }
+                        except Exception as e:
+                            logger.error(f"LSTM prediction error for {symbol}: {e}")
+                    
+                    # Use cached/latest values
+                    cached = self.last_lstm_predictions[symbol]
+                    lstm_direction = cached['direction']
+                    lstm_probs = cached['probs']
+                    lstm_pred_class = cached['pred_class']
                 
                 timestamp = last_row['start_ts']
                 price = last_row['close']
@@ -813,12 +1024,18 @@ class MarketPredictor:
                         'PUMP': float(probs[1]),
                         'DUMP': float(probs[2])
                     },
-                    'pred_class': int(pred_class)
+                    'pred_class': int(pred_class),
+                    'lstm_direction': lstm_direction,
+                    'lstm_confidence': float(lstm_probs[lstm_pred_class]) if lstm_direction != "N/A" else 0.0
                 }
 
                 # Display all prediction results with full probability distribution
+                lstm_info = ""
+                if lstm_direction != "N/A":
+                    lstm_info = f" | LSTM: {lstm_direction} ({lstm_probs[lstm_pred_class]:.2%})"
+                    
                 logger.info(
-                    f"{symbol.upper()} | Price: ${price:.2f} | OFI: {last_row['delta']:.2f} | Pred: {direction} ({confidence:.2%}) | NEUTRAL: {probs[0]:.2%} | PUMP: {probs[1]:.2%} | DUMP: {probs[2]:.2%}")
+                    f"{symbol.upper()} | Price: ${price:.2f} | OFI: {last_row['delta']:.2f} | LGBM: {direction} ({confidence:.2%}){lstm_info} | NEUTRAL: {probs[0]:.2%} | PUMP: {probs[1]:.2%} | DUMP: {probs[2]:.2%}")
 
                 # Check if we should send initial status message
                 if not self.initial_message_sent:
@@ -928,24 +1145,75 @@ class MarketPredictor:
 
         self.ws.run_forever()
 
+
+    def check_for_trigger(self, symbol, prob_pump, prob_dump, ofi):
+        # Determine current raw signal
+        current_signal = "WAIT"
+
+        # --- UP TREND TRIGGER (PUMP) ---
+        # Logic: Model thinks Pump is likely (>40%) AND Order Flow confirms buying (>0.5)
+        if prob_pump > self.PROB_THRESHOLD and ofi > self.OFI_THRESHOLD:
+            current_signal = "LONG_ENTRY"
+
+        # --- DOWN TREND TRIGGER (DUMP) ---
+        # Logic: Model thinks Dump is likely (>40%) AND Order Flow confirms selling (<-0.5)
+        elif prob_dump > self.PROB_THRESHOLD and ofi < -self.OFI_THRESHOLD:
+            current_signal = "SHORT_ENTRY"
+
+        # Get previous state
+        if symbol not in self.signal_counters:
+            self.signal_counters[symbol] = {'type': 'WAIT', 'count': 0}
+            
+        state = self.signal_counters[symbol]
+        
+        # Check for consecutive signals
+        if current_signal == state['type'] and current_signal != "WAIT":
+            state['count'] += 1
+            # Cap the counter to prevent infinite growth since we only care about the threshold
+            if state['count'] > self.CONSECUTIVE_SIGNAL_THRESHOLD + 10:
+                state['count'] = self.CONSECUTIVE_SIGNAL_THRESHOLD + 1
+        else:
+            # Reset or start new count
+            state['type'] = current_signal
+            state['count'] = 1 if current_signal != "WAIT" else 0
+            
+        # Trigger ONLY on the exact Nth occurrence
+        # This prevents endless messages when the trigger remains True for a long time
+        if state['count'] == self.CONSECUTIVE_SIGNAL_THRESHOLD:
+            logger.info(f"Trigger confirmed for {symbol}: {current_signal} (3 consecutive signals)")
+            return current_signal
+            
+        return "WAIT"
+
 if __name__ == "__main__":
     logger.info(f"Initializing Market Predictor for symbols: {SYMBOLS}")
     predictor = MarketPredictor(SYMBOLS)
     
     # 1. Check for existing models and load them
     models_loaded = {}
+    lstm_models_loaded = {}
+    
     for symbol in SYMBOLS:
         models_loaded[symbol] = predictor.load_model_if_valid(symbol, max_age_days=2)
         if models_loaded[symbol]:
-            logger.info(f"✓ Model loaded for {symbol}")
+            logger.info(f"✓ LGBM Model loaded for {symbol}")
         else:
-            logger.info(f"✗ Model not found or too old for {symbol}")
+            logger.info(f"✗ LGBM Model not found or too old for {symbol}")
+            
+        # Check LSTM
+        lstm_models_loaded[symbol] = predictor.load_lstm_model_if_valid(symbol, max_age_days=3)
+        if lstm_models_loaded[symbol]:
+            logger.info(f"✓ LSTM Model loaded for {symbol}")
+        else:
+            logger.info(f"✗ LSTM Model not found or too old for {symbol}")
     
     # 2. Fetch Data
     # If all models are loaded, we just need enough data for the buffer (e.g. 2 days)
     # If we need to train any model, we fetch more (e.g. 5 days)
-    all_models_loaded = all(models_loaded.values())
-    days_to_fetch = 2 if all_models_loaded else 5
+    all_lgbm_loaded = all(models_loaded.values())
+    all_lstm_loaded = all(lstm_models_loaded.values()) if predictor.ENABLE_LSTM else True
+    
+    days_to_fetch = 2 if (all_lgbm_loaded and all_lstm_loaded) else 5
     
     logger.info(f"Fetching {days_to_fetch} days of historical data...")
     df = predictor.fetch_historical_data(SYMBOLS, days=days_to_fetch)
@@ -953,15 +1221,20 @@ if __name__ == "__main__":
     if not df.empty and len(df) > 10:
         # 3. Train Models if needed (per symbol)
         for symbol in SYMBOLS:
+            # Filter data for this symbol
+            symbol_df = df[df['symbol'] == symbol.upper()].copy()
+            
             if not models_loaded[symbol]:
-                logger.info(f"Training model for {symbol.upper()}...")
-                # Filter data for this symbol
-                symbol_df = df[df['symbol'] == symbol.upper()].copy()
+                logger.info(f"Training LGBM model for {symbol.upper()}...")
                 if len(symbol_df) > 10:
                     predictor.train_model(symbol.upper(), symbol_df)
-                    logger.info(f"✓ Model trained for {symbol.upper()}")
+                    logger.info(f"✓ LGBM Model trained for {symbol.upper()}")
                 else:
-                    logger.warning(f"✗ Not enough data for {symbol.upper()}. Skipping training.")
+                    logger.warning(f"✗ Not enough data for {symbol.upper()}. Skipping LGBM training.")
+            
+            # Train LSTM if enabled and not loaded
+            if predictor.ENABLE_LSTM and not lstm_models_loaded[symbol]:
+                predictor.train_lstm_model(symbol.upper(), symbol_df)
         
         # 4. Live Predict
         try:

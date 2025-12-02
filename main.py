@@ -60,22 +60,30 @@ class MarketPredictor:
         ]
         self.running = False
         self.latest_data = {}  # symbol -> list of data
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
+
+        self.send_hourly_message = False
         
         # Telegram notification tracking per symbol
         self.previous_probs = {}  # symbol -> {'NEUTRAL': 0.0, 'PUMP': 0.0, 'DUMP': 0.0}
-        self.last_hourly_message_time = {}  # symbol -> datetime
+        self.last_hourly_message_time = None  # Global timestamp for hourly updates
         self.last_prediction_data = {}  # symbol -> prediction dict
         self.active_events = {}  # symbol -> {'NEUTRAL': False, 'PUMP': False, 'DUMP': False}
+        self.last_nightly_chart_time = None  # Track last nightly chart generation
+        
+        # Batching for threshold crossing alerts
+        self.pending_alerts = []  # List of (symbol, category) tuples
+        self.alert_batch_timer = None  # Timer for sending batched alerts
+        self.alert_batch_delay = 2.0  # Wait 2 seconds to batch alerts from multiple symbols
         
         # Initialize per-symbol data structures
         for symbol in self.symbols:
             self.latest_data[symbol] = []
             self.previous_probs[symbol] = {'NEUTRAL': 0.0, 'PUMP': 0.0, 'DUMP': 0.0}
-            self.last_hourly_message_time[symbol] = None
             self.last_prediction_data[symbol] = None
             self.active_events[symbol] = {'NEUTRAL': False, 'PUMP': False, 'DUMP': False}
         
+        self.initial_message_sent = False
         self.ws = None
 
     def handle_exit(self, signum, frame):
@@ -162,6 +170,115 @@ class MarketPredictor:
             logger.error(f"Error generating candle chart: {e}")
             return None
 
+    def generate_latest_chart(self, symbol):
+        """Generate 1m candle chart for the last 60 minutes for a symbol"""
+        data_copy = []
+        with self.lock:
+            if symbol in self.latest_data:
+                data_copy = list(self.latest_data[symbol])
+        
+        if not data_copy:
+            return None
+            
+        try:
+            df_all = pd.DataFrame(data_copy)
+            if 'symbol' in df_all.columns:
+                df_all = df_all[df_all['symbol'].str.lower() == symbol.lower()].copy()
+            
+            if 'start_ts' in df_all.columns:
+                df_all['start_ts'] = pd.to_datetime(df_all['start_ts'])
+                df_all.set_index('start_ts', inplace=True)
+                
+                df_1m = df_all.resample('1min').agg({
+                    'open': 'first',
+                    'high': 'max',
+                    'low': 'min',
+                    'close': 'last',
+                    'total_volume': 'sum'
+                }).dropna()
+                
+                if len(df_1m) >= 5:
+                    df_chart = df_1m.tail(60).copy()
+                    df_chart = df_chart.reset_index()
+                    return self.generate_candle_chart(df_chart, symbol)
+        except Exception as e:
+            logger.error(f"Error generating latest chart for {symbol}: {e}")
+            
+        return None
+
+    def send_status_message(self, title, alerts=None):
+        """Send a status message with optional alerts highlighted"""
+        if alerts is None:
+            alerts = []
+            
+        # Build aggregated message
+        message = f"{title}\n\n"
+        
+        # Iterate over ALL symbols to build the message
+        for sym in self.symbols:
+            pred_data = self.last_prediction_data.get(sym)
+            if pred_data:
+                # Get emoji for prediction direction
+                direction_emoji = ""
+                if pred_data['direction'] == "PUMP":
+                    direction_emoji = "🚀"
+                elif pred_data['direction'] == "DUMP":
+                    direction_emoji = "📉"
+                elif pred_data['direction'] == "NEUTRAL":
+                    direction_emoji = "➖"
+                
+                # Check if this symbol has an alert
+                crossed = [cat for s, cat in alerts if s == sym]
+                
+                # Add header with alert indicator
+                if crossed:
+                    message += f"⚠️ <b>{sym.upper()} (ALERT: {', '.join(crossed)})</b>\n"
+                else:
+                    message += f"<b>{sym.upper()}</b>\n"
+                
+                message += f"Price: ${pred_data['price']:.2f}\n"
+                message += f"OFI: {pred_data['delta']:.2f}\n"
+                message += f"Prediction: <b>{direction_emoji} {pred_data['direction']}</b> ({pred_data['confidence']:.2%})\n"
+                message += f"Probabilities:\n"
+                message += f"NEUTRAL: {pred_data['probs']['NEUTRAL']:.2%}\n"
+                message += f"PUMP: {pred_data['probs']['PUMP']:.2%}\n"
+                message += f"DUMP: {pred_data['probs']['DUMP']:.2%}\n"
+                message += "\n"
+        
+        # Generate chart
+        chart_bytes = None
+        target_symbol = None
+        
+        if alerts:
+            # If alerts exist, chart the first alerted symbol
+            # alerts is list of (symbol, category)
+            target_symbol = alerts[0][0]
+        elif self.symbols:
+            # If no alerts (e.g. initial message), chart the first configured symbol
+            target_symbol = self.symbols[0]
+            
+        if target_symbol:
+            chart_bytes = self.generate_latest_chart(target_symbol)
+            
+        if chart_bytes:
+            self.send_telegram_photo(chart_bytes, message)
+        else:
+            self.send_telegram_message(message)
+
+    def send_batched_alerts(self):
+        """Send a single aggregated message for all pending threshold crossing alerts"""
+        alerts_to_send = []
+        with self.lock:
+            if not self.pending_alerts:
+                return
+            
+            # Copy and clear pending alerts
+            alerts_to_send = list(self.pending_alerts)
+            self.pending_alerts = []
+            self.alert_batch_timer = None
+        
+        self.send_status_message("🚨 <b>ALERT: Threshold Crossed!</b>", alerts_to_send)
+    
     def send_followup(self, symbol, category, trigger_price, trigger_time, label):
         """Send follow-up notification with chart"""
         try:
@@ -176,6 +293,10 @@ class MarketPredictor:
             df_all = pd.DataFrame(data_copy)
             if 'start_ts' not in df_all.columns:
                 return
+            
+            # Filter to ensure only this symbol's data (in case of mixed data)
+            if 'symbol' in df_all.columns:
+                df_all = df_all[df_all['symbol'].str.lower() == symbol.lower()].copy()
             
             # Handle mixed types
             df_all['start_ts'] = pd.to_datetime(df_all['start_ts'])
@@ -223,7 +344,9 @@ class MarketPredictor:
             elif category == "DUMP":
                 emoji = "✅" if pct_change < 0 else "❌"
             
-            message = f"⏱️ <b>{label} Follow-up: {category} ({symbol.upper()})</b>\n\n"
+            # Get emoji for category
+            category_emoji = "🚀" if category == "PUMP" else "📉" if category == "DUMP" else "➖"
+            message = f"⏱️ <b>{label} Follow-up: {category_emoji} {category} ({symbol.upper()})</b>\n\n"
             message += f"Trigger Price: ${trigger_price:.2f}\n"
             message += f"Current Price: ${current_price:.2f}\n"
             message += f"Change: {pct_change:.2%} {emoji}\n"
@@ -246,15 +369,7 @@ class MarketPredictor:
         """Check if notifications should be sent based on threshold crossing or hourly schedule"""
         current_time = datetime.now()
         
-        # Store the latest prediction data for this symbol
-        self.last_prediction_data[symbol] = {
-            'timestamp': timestamp,
-            'price': price,
-            'delta': delta,
-            'direction': direction,
-            'confidence': confidence,
-            'probs': probs
-        }
+        # Note: Prediction data is now stored in on_message method before calling this function
         
         # Check for 60% threshold crossing from below for each category
         threshold = 0.60
@@ -263,6 +378,9 @@ class MarketPredictor:
             'PUMP': probs[1],
             'DUMP': probs[2]
         }
+        
+        # Track which symbols crossed thresholds in this call
+        symbols_with_alerts = []
         
         for category in ['NEUTRAL', 'PUMP', 'DUMP']:
             prev_prob = self.previous_probs[symbol][category]
@@ -287,83 +405,146 @@ class MarketPredictor:
                 t120 = threading.Timer(2 * 60 * 60, self.send_followup, args=[symbol, category, price, timestamp, "2h"])
                 t120.start()
                 
-                message = f"🚨 <b>ALERT: {symbol.upper()} {category} crossed 60% threshold!</b>\n\n"
-                message += f"Current Price: ${price:.2f}\n"
-                message += f"Order Flow Imbalance (OFI): {delta:.2f}\n\n"
-                message += f"Prediction: <b>{direction}</b> (Confidence: {confidence:.2%})\n\n"
-                message += f"Probability Distribution:\n"
-                message += f"  - NEUTRAL: {probs[0]:.2%}\n"
-                message += f"  - PUMP:    {probs[1]:.2%}\n"
-                message += f"  - DUMP:    {probs[2]:.2%}"
+                # Track this alert
+                symbols_with_alerts.append((symbol, category))
+        
+        # Batch alerts instead of sending immediately
+        if symbols_with_alerts:
+            with self.lock:
+                # Add alerts to pending list
+                self.pending_alerts.extend(symbols_with_alerts)
                 
-                self.send_telegram_message(message)
+                # Cancel existing timer if any
+                if self.alert_batch_timer is not None:
+                    self.alert_batch_timer.cancel()
                 
-                # Collect data for chart
-                # Note: self.lock is already held by the caller (on_message method)
-                if len(self.latest_data[symbol]) > 0:
-                    # Convert to DataFrame
-                    df_all = pd.DataFrame(self.latest_data[symbol])
-                    
-                    # Ensure start_ts is datetime
-                    if 'start_ts' in df_all.columns:
-                        # Handle mixed types (strings from WS, datetimes from history)
-                        df_all['start_ts'] = pd.to_datetime(df_all['start_ts'])
-                        
-                        # Set index for resampling
-                        df_all.set_index('start_ts', inplace=True)
-                        
-                        # Resample to 1-minute candles
-                        # Aggregation rules:
-                        # Open: first
-                        # High: max
-                        # Low: min
-                        # Close: last
-                        # Volume: sum
-                        df_1m = df_all.resample('1min').agg({
-                            'open': 'first',
-                            'high': 'max',
-                            'low': 'min',
-                            'close': 'last',
-                            'total_volume': 'sum'
-                        }).dropna()
-                        
-                        # Take up to the last 60 candles (minimum 5)
-                        if len(df_1m) >= 5:
-                            df_chart = df_1m.tail(60).copy()
-                            
-                            # Reset index to make start_ts a column again for generate_candle_chart
-                            df_chart = df_chart.reset_index()
-                            
-                            logger.info(f"Generating candle chart for {symbol} with {len(df_chart)} 1m candles...")
-                            chart_bytes = self.generate_candle_chart(df_chart, symbol)
-                            
-                            if chart_bytes:
-                                caption = f"📈 <b>{symbol.upper()} Price Chart - Last {len(df_chart)} Candles (1m)</b>\n{category} crossed 60% threshold"
-                                self.send_telegram_photo(chart_bytes, caption)
-                                                                
-                        else:
-                            logger.warning(f"Not enough data for 1m chart for {symbol}. Have {len(df_1m)} candles, need 5.")
+                # Start new timer to send batched alerts after delay
+                self.alert_batch_timer = threading.Timer(self.alert_batch_delay, self.send_batched_alerts)
+                self.alert_batch_timer.start()
         
         # Update previous probabilities for this symbol
         self.previous_probs[symbol] = current_probs.copy()
         
         # Check for hourly update
-        if self.last_hourly_message_time[symbol] is None:
-            self.last_hourly_message_time[symbol] = current_time
+        if self.last_hourly_message_time is None:
+            self.last_hourly_message_time = current_time
         
-        time_since_last_hourly = (current_time - self.last_hourly_message_time[symbol]).total_seconds()
-        if time_since_last_hourly >= 3600:  # 3600 seconds = 1 hour
-            message = f"📊 <b>Hourly Update ({symbol.upper()})</b>\n\n"
-            message += f"Current Price: ${price:.2f}\n"
-            message += f"Order Flow Imbalance (OFI): {delta:.2f}\n\n"
-            message += f"Prediction: <b>{direction}</b> (Confidence: {confidence:.2%})\n\n"
-            message += f"Probability Distribution:\n"
-            message += f"  - NEUTRAL: {probs[0]:.2%}\n"
-            message += f"  - PUMP:    {probs[1]:.2%}\n"
-            message += f"  - DUMP:    {probs[2]:.2%}"
+        time_since_last_hourly = (current_time - self.last_hourly_message_time).total_seconds()
+        if time_since_last_hourly >= 3600 and self.send_hourly_message:  # 3600 seconds = 1 hour
+            self.send_status_message("📊 <b>Hourly Update - All Symbols</b>")
+            self.last_hourly_message_time = current_time
+        
+        # Check for nightly chart generation (once per day at night)
+        # Trigger if: 
+        # 1. Never sent before (last_nightly_chart_time is None), OR
+        # 2. More than 24 hours have passed since last nightly chart
+        # 3. Current time is between midnight and 1 AM (0:00 - 1:00)
+        if self.last_nightly_chart_time is None:
+            # First time - check if it's nighttime (between 0:00 and 1:00)
+            if 0 <= current_time.hour < 1:
+                logger.info("First nightly chart - triggering generation...")
+                threading.Thread(target=self.generate_nightly_charts).start()
+        else:
+            time_since_last_nightly = (current_time - self.last_nightly_chart_time).total_seconds()
+            # If more than 24 hours and it's nighttime (0:00 - 1:00)
+            if time_since_last_nightly >= 86400 and 0 <= current_time.hour < 1:
+                logger.info("24 hours passed and it's nighttime - triggering nightly chart generation...")
+                threading.Thread(target=self.generate_nightly_charts).start()
+
+    def generate_nightly_charts(self):
+        """Generate and send 1-hour timeframe charts for all symbols covering the last 24 hours"""
+        try:
+            logger.info("Generating nightly charts for all symbols...")
             
-            self.send_telegram_message(message)
-            self.last_hourly_message_time[symbol] = current_time
+            for symbol in self.symbols:
+                with self.lock:
+                    if symbol not in self.latest_data or not self.latest_data[symbol]:
+                        logger.warning(f"No data available for {symbol} to generate nightly chart.")
+                        continue
+                    # Copy data to avoid holding lock during processing
+                    data_copy = list(self.latest_data[symbol])
+                
+                # Process data (unlocked)
+                df_all = pd.DataFrame(data_copy)
+                if 'start_ts' not in df_all.columns:
+                    logger.warning(f"Missing start_ts column for {symbol}.")
+                    continue
+                
+                # Filter to ensure only this symbol's data
+                if 'symbol' in df_all.columns:
+                    df_all = df_all[df_all['symbol'].str.lower() == symbol.lower()].copy()
+                
+                # Handle mixed types (strings from WS, datetimes from history)
+                df_all['start_ts'] = pd.to_datetime(df_all['start_ts'])
+                df_all.set_index('start_ts', inplace=True)
+                
+                # Resample to 1-hour candles
+                df_1h = df_all.resample('1h').agg({
+                    'open': 'first',
+                    'high': 'max',
+                    'low': 'min',
+                    'close': 'last',
+                    'total_volume': 'sum'
+                }).dropna()
+                
+                if df_1h.empty:
+                    logger.warning(f"No 1h candle data available for {symbol}.")
+                    continue
+                
+                # Get last 24 hours of data (24 candles)
+                df_chart = df_1h.tail(24).copy()
+                
+                if len(df_chart) < 5:
+                    logger.warning(f"Not enough 1h candles for {symbol}. Have {len(df_chart)}, need at least 5.")
+                    continue
+                
+                # Reset index for chart generation
+                df_chart_reset = df_chart.reset_index()
+                
+                # Generate chart with modified title for 1h timeframe
+                logger.info(f"Generating nightly 1h chart for {symbol} with {len(df_chart)} candles...")
+                
+                # Prepare data for mplfinance
+                chart_df = df_chart_reset[['start_ts', 'open', 'high', 'low', 'close', 'total_volume']].copy()
+                chart_df.columns = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']
+                chart_df.set_index('Date', inplace=True)
+                
+                # Create the chart with 1h title
+                try:
+                    fig, axes = mpf.plot(
+                        chart_df,
+                        type='candle',
+                        style='charles',
+                        title=f'{symbol.upper()} Price Chart - Last 24 Hours (1h candles)',
+                        ylabel='Price (USD)',
+                        volume=True,
+                        ylabel_lower='Volume',
+                        figsize=(12, 8),
+                        returnfig=True
+                    )
+                    
+                    # Save to bytes buffer
+                    buf = io.BytesIO()
+                    fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+                    buf.seek(0)
+                    plt.close(fig)
+                    
+                    chart_bytes = buf.getvalue()
+                    
+                    if chart_bytes:
+                        caption = f"🌙 <b>Nightly Chart: {symbol.upper()}</b>\n📊 1-hour timeframe - Last 24 hours ({len(df_chart)} candles)"
+                        self.send_telegram_photo(chart_bytes, caption)
+                        logger.info(f"Nightly chart sent for {symbol}.")
+                    
+                except Exception as e:
+                    logger.error(f"Error generating nightly chart for {symbol}: {e}")
+                    
+            # Update last nightly chart time
+            self.last_nightly_chart_time = datetime.now()
+            logger.info("Nightly chart generation completed.")
+            
+        except Exception as e:
+            logger.error(f"Error in generate_nightly_charts: {e}")
 
     def fetch_historical_data(self, symbols, days=3):
         logger.info(f"Fetching data for symbols {symbols} for the last {days} days in 3 requests...")
@@ -620,19 +801,33 @@ class MarketPredictor:
                 direction = direction_map[pred_class]
                 confidence = probs[pred_class]
                 
+                # Store the current prediction values for this symbol
+                self.last_prediction_data[symbol] = {
+                    'timestamp': timestamp,
+                    'price': price,
+                    'delta': last_row['delta'],
+                    'direction': direction,
+                    'confidence': confidence,
+                    'probs': {
+                        'NEUTRAL': float(probs[0]),
+                        'PUMP': float(probs[1]),
+                        'DUMP': float(probs[2])
+                    },
+                    'pred_class': int(pred_class)
+                }
+
                 # Display all prediction results with full probability distribution
-                # print(f"\n{'='*80}")
-                # print(f"[{timestamp}] LIVE PREDICTION for {symbol.upper()}")
-                # print(f"{'='*80}")
-                # print(f"Current Price: ${price:.2f}")
-                # print(f"Order Flow Imbalance (OFI): {last_row['delta']:.2f}")
-                # print(f"\nPrediction: {direction} (Confidence: {confidence:.2%})")
-                # print(f"\nProbability Distribution:")
-                # print(f"  - NEUTRAL: {probs[0]:.2%}")
-                # print(f"  - PUMP:    {probs[1]:.2%}")
-                # print(f"  - DUMP:    {probs[2]:.2%}")
-                # print(f"{'='*80}\n")
-                
+                logger.info(
+                    f"{symbol.upper()} | Price: ${price:.2f} | OFI: {last_row['delta']:.2f} | Pred: {direction} ({confidence:.2%}) | NEUTRAL: {probs[0]:.2%} | PUMP: {probs[1]:.2%} | DUMP: {probs[2]:.2%}")
+
+                # Check if we should send initial status message
+                if not self.initial_message_sent:
+                    # Check if we have data for all symbols
+                    if all(self.last_prediction_data.get(s) for s in self.symbols):
+                        logger.info("Sending initial status message...")
+                        self.send_status_message("🚀 <b>Bot Started - Initial Status</b>")
+                        self.initial_message_sent = True
+
                 # Send Telegram notifications if conditions are met
                 self.check_and_send_notifications(
                     symbol=symbol,
@@ -672,8 +867,45 @@ class MarketPredictor:
                     # We'll handle this mixed type in check_and_send_notifications.
                     records = symbol_data.to_dict('records')
                     # Ensure we don't exceed the buffer size we want to maintain
-                    self.latest_data[symbol.upper()] = records[-20000:]
-                    logger.info(f"Pre-filled buffer for {symbol.upper()} with {len(self.latest_data[symbol.upper()])} records from history.")
+                    self.latest_data[symbol] = records[-20000:]
+                    logger.info(f"Pre-filled buffer for {symbol} with {len(self.latest_data[symbol])} records from history.")
+                    
+                    # Run initial prediction on historical data to populate status
+                    if len(self.latest_data[symbol]) >= 20 and symbol in self.models and self.models[symbol]:
+                        try:
+                            df = pd.DataFrame(self.latest_data[symbol])
+                            df = self.prepare_features(df)
+                            last_row = df.iloc[-1]
+                            
+                            features = last_row[self.feature_cols].values.reshape(1, -1)
+                            prediction = self.models[symbol].predict(features)
+                            pred_class = np.argmax(prediction[0])
+                            probs = prediction[0]
+                            
+                            direction_map = {0: "NEUTRAL", 1: "PUMP", 2: "DUMP"}
+                            
+                            self.last_prediction_data[symbol] = {
+                                'timestamp': last_row['start_ts'],
+                                'price': last_row['close'],
+                                'delta': last_row['delta'],
+                                'direction': direction_map[pred_class],
+                                'confidence': probs[pred_class],
+                                'probs': {
+                                    'NEUTRAL': float(probs[0]),
+                                    'PUMP': float(probs[1]),
+                                    'DUMP': float(probs[2])
+                                },
+                                'pred_class': int(pred_class)
+                            }
+                        except Exception as e:
+                            logger.error(f"Error running initial prediction for {symbol}: {e}")
+
+        # Check if we can send initial status message immediately
+        if not self.initial_message_sent:
+            if all(self.last_prediction_data.get(s) for s in self.symbols):
+                logger.info("Sending initial status message from historical data...")
+                self.send_status_message("🚀 <b>Bot Started - Initial Status</b>")
+                self.initial_message_sent = True
         
         websocket.enableTrace(False)
         ws_headers = {}
@@ -703,7 +935,7 @@ if __name__ == "__main__":
     # 1. Check for existing models and load them
     models_loaded = {}
     for symbol in SYMBOLS:
-        models_loaded[symbol] = predictor.load_model_if_valid(symbol, max_age_days=50)
+        models_loaded[symbol] = predictor.load_model_if_valid(symbol, max_age_days=2)
         if models_loaded[symbol]:
             logger.info(f"✓ Model loaded for {symbol}")
         else:

@@ -1301,10 +1301,7 @@ class MarketPredictor:
         
         # Broadcast to WebSocket clients
         self.broadcast_hedge_data(hedge_payload)
-            
-        # Check for change
-        previous_season = self.market_regime.get("season", "NEUTRAL")
-            
+
         # Check for change
         previous_season = self.market_regime.get("season", "NEUTRAL")
         

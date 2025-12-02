@@ -1,1 +1,6 @@
 /.env
+/lgb_model.txt
+/lgb_model_BTCUSDT.txt
+/lgb_model_ETHUSDT.txt
+/lgb_model_SOLUSDT.txt
+/market_predictor.service

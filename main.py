@@ -546,7 +546,7 @@ class MarketPredictor:
         # Evaluate
         y_pred = model.predict(X_test)
         y_pred_class = [np.argmax(x) for x in y_pred]
-        logger.info(f"Model evaluation:\n{classification_report(y_test, y_pred_class)}")
+        logger.info(f"Model evaluation:\n{classification_report(y_test, y_pred_class, zero_division=0)}")
         
         # Save model
         model_file = self.get_model_file(symbol)

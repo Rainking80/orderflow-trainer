@@ -5,6 +5,8 @@ import lightgbm as lgb
 import numpy as np
 import websocket
 import threading
+import asyncio
+import websockets
 import time
 import io
 import os
@@ -106,6 +108,11 @@ class MarketPredictor:
         self.initial_message_sent = False
         self.ENABLE_LSTM = True # Set to True to enable LSTM training
         self.ws = None
+        
+        # Hedge Fund WebSocket Server
+        self.server_clients = set()
+        self.server_loop = None
+        self.server_thread = None
 
     def handle_exit(self, signum, frame):
         logger.info(f"Received signal {signum}. Exiting gracefully...")
@@ -1106,11 +1113,29 @@ class MarketPredictor:
             mean_dump = np.mean([item['probs']['DUMP'] for item in history])
             mean_ofi = np.mean([item['delta'] for item in history])
             
+            # Calculate LSTM means (if available)
+            lstm_pumps = [item.get('lstm_probs', {}).get('PUMP', 0.0) for item in history if item.get('lstm_direction', 'N/A') != 'N/A']
+            lstm_dumps = [item.get('lstm_probs', {}).get('DUMP', 0.0) for item in history if item.get('lstm_direction', 'N/A') != 'N/A']
+            
+            mean_lstm_pump = np.mean(lstm_pumps) if lstm_pumps else 0.0
+            mean_lstm_dump = np.mean(lstm_dumps) if lstm_dumps else 0.0
+            
             return {
                 'pump': mean_pump,
                 'dump': mean_dump,
-                'ofi': mean_ofi
+                'ofi': mean_ofi,
+                'lstm_pump': mean_lstm_pump,
+                'lstm_dump': mean_lstm_dump
             }
+
+        # Initialize variables
+        btc_pump_prob = 0.0
+        btc_dump_prob = 0.0
+        btc_ofi = 0.0
+        
+        avg_alt_pump_prob = 0.0
+        avg_alt_dump_prob = 0.0
+        avg_alt_ofi = 0.0
 
         # Calculate averages for BTC
         btc_avgs = get_avg_metrics('btcusdt')
@@ -1137,7 +1162,11 @@ class MarketPredictor:
             avg_alt_dump_prob = np.mean(alt_dump_probs)
             avg_alt_ofi = np.mean(alt_ofis)
         
-        # Determine Season
+        # --- BTC DOMINANCE PROXY ---
+        # Calculate relative strength of BTC vs Alts
+        # Positive = BTC Stronger (Dominance Rising)
+        # Negative = Alts Stronger (Dominance Falling)
+        btc_dominance_proxy = (btc_pump_prob - btc_dump_prob) - (avg_alt_pump_prob - avg_alt_dump_prob)
         
         # Determine Season
         season = "NEUTRAL"
@@ -1156,23 +1185,125 @@ class MarketPredictor:
             confidence = (btc_pump_prob + avg_alt_pump_prob) / 2
             details = "Global rally detected."
             
-        # 3. BTC SEASON: BTC is strong, Alts are weak/neutral
-        elif btc_pump_prob > avg_alt_pump_prob + 0.1:
+        # 3. BTC SEASON (Dominance Rising)
+        elif btc_dominance_proxy > 0.15:
             season = "BTC_SEASON"
-            confidence = btc_pump_prob - avg_alt_pump_prob
-            details = f"BTC leading (Pump Prob: {btc_pump_prob:.2f} vs Alts: {avg_alt_pump_prob:.2f})"
+            confidence = abs(btc_dominance_proxy)
+            details = f"Money flowing into BTC (Dom Proxy: {btc_dominance_proxy:.2f})"
             
-        # 4. ALT SEASON: Alts are strong, BTC is stable/weak (but not dumping hard)
-        elif avg_alt_pump_prob > btc_pump_prob + 0.1 and btc_dump_prob < 0.6:
+        # 4. ALT SEASON (Dominance Falling)
+        elif btc_dominance_proxy < -0.15:
             season = "ALT_SEASON"
-            confidence = avg_alt_pump_prob - btc_pump_prob
-            details = f"Alts leading (Avg Pump Prob: {avg_alt_pump_prob:.2f} vs BTC: {btc_pump_prob:.2f})"
+            confidence = abs(btc_dominance_proxy)
+            details = f"Money flowing into Alts (Dom Proxy: {btc_dominance_proxy:.2f})"
             
         # 5. DIVERGENCE: BTC Dumping, Alts Pumping (Rare/Risky)
         elif btc_dump_prob > 0.6 and avg_alt_pump_prob > 0.5:
             season = "DIVERGENCE_RISK"
             confidence = (btc_dump_prob + avg_alt_pump_prob) / 2
             details = "BTC dumping while Alts pump. High risk."
+            
+        # --- HEDGE FUND DATA BROADCAST ---
+        # Calculate scores for the hedge bot
+        
+        # 1. Market Regime Score (-1.0 to 1.0)
+        # Bullish = +1, Bearish = -1
+        # We use the aggregate pump - dump probability
+        # BTC weight 50%, Alts weight 50%
+        btc_net_score = btc_pump_prob - btc_dump_prob
+        alt_net_score = avg_alt_pump_prob - avg_alt_dump_prob
+        market_regime_score = (btc_net_score + alt_net_score) / 2
+        
+        # 2. Spread Matrix (Relative Strength)
+        # We need individual strengths
+        # If we have specific alts, calculate their specific scores
+        eth_avgs = get_avg_metrics('ethusdt')
+        sol_avgs = get_avg_metrics('solusdt')
+        
+        # Helper to calculate composite score (LGBM + LSTM)
+        def calc_composite_score(avgs):
+            if not avgs: return 0.0
+            lgbm_score = avgs['pump'] - avgs['dump']
+            lstm_score = avgs['lstm_pump'] - avgs['lstm_dump']
+            # Weight: 70% LGBM, 30% LSTM (since LSTM is throttled/slower)
+            if lstm_score != 0:
+                return (lgbm_score * 0.7) + (lstm_score * 0.3)
+            return lgbm_score
+            
+        def get_direction_label(score):
+            if score > 0.05: return "PUMP"
+            if score < -0.05: return "DUMP"
+            return "NEUTRAL"
+        
+        btc_comp_score = calc_composite_score(btc_avgs)
+        eth_comp_score = calc_composite_score(eth_avgs)
+        sol_comp_score = calc_composite_score(sol_avgs)
+        
+        # Calculate raw sub-scores for labeling
+        btc_lgbm = btc_pump_prob - btc_dump_prob
+        btc_lstm = (btc_avgs['lstm_pump'] - btc_avgs['lstm_dump']) if btc_avgs else 0.0
+        
+        eth_lgbm = (eth_avgs['pump'] - eth_avgs['dump']) if eth_avgs else 0.0
+        eth_lstm = (eth_avgs['lstm_pump'] - eth_avgs['lstm_dump']) if eth_avgs else 0.0
+        
+        sol_lgbm = (sol_avgs['pump'] - sol_avgs['dump']) if sol_avgs else 0.0
+        sol_lstm = (sol_avgs['lstm_pump'] - sol_avgs['lstm_dump']) if sol_avgs else 0.0
+        
+        spread_matrix = {
+            "btc_vs_eth": btc_comp_score - eth_comp_score, # >0 means BTC stronger
+            "btc_vs_sol": btc_comp_score - sol_comp_score,
+            "eth_vs_sol": eth_comp_score - sol_comp_score
+        }
+        
+        hedge_payload = {
+            "timestamp": datetime.now().isoformat(),
+            "market_regime": {
+                "season": season,
+                "score": float(market_regime_score), # -1.0 (Bear) to 1.0 (Bull)
+                "confidence": float(confidence),
+                "details": details
+            },
+            "btc_dominance": {
+                "score": float(btc_dominance_proxy), # >0 Rising, <0 Falling
+                "trend": "RISING" if btc_dominance_proxy > 0.05 else "FALLING" if btc_dominance_proxy < -0.05 else "NEUTRAL"
+            },
+            "spread_matrix": spread_matrix,
+            "assets": {
+                "btc": {
+                    "score": float(btc_comp_score),
+                    "direction": get_direction_label(btc_comp_score),
+                    "lgbm_score": float(btc_lgbm),
+                    "lgbm_direction": get_direction_label(btc_lgbm),
+                    "lstm_score": float(btc_lstm),
+                    "lstm_direction": get_direction_label(btc_lstm),
+                    "ofi": float(btc_ofi)
+                },
+                "eth": {
+                    "score": float(eth_comp_score),
+                    "direction": get_direction_label(eth_comp_score),
+                    "lgbm_score": float(eth_lgbm),
+                    "lgbm_direction": get_direction_label(eth_lgbm),
+                    "lstm_score": float(eth_lstm),
+                    "lstm_direction": get_direction_label(eth_lstm),
+                    "ofi": float(eth_avgs['ofi'])
+                } if eth_avgs else {},
+                "sol": {
+                    "score": float(sol_comp_score),
+                    "direction": get_direction_label(sol_comp_score),
+                    "lgbm_score": float(sol_lgbm),
+                    "lgbm_direction": get_direction_label(sol_lgbm),
+                    "lstm_score": float(sol_lstm),
+                    "lstm_direction": get_direction_label(sol_lstm),
+                    "ofi": float(sol_avgs['ofi'])
+                } if sol_avgs else {}
+            }
+        }
+        
+        # Broadcast to WebSocket clients
+        self.broadcast_hedge_data(hedge_payload)
+            
+        # Check for change
+        previous_season = self.market_regime.get("season", "NEUTRAL")
             
         # Check for change
         previous_season = self.market_regime.get("season", "NEUTRAL")
@@ -1236,6 +1367,10 @@ class MarketPredictor:
             return
 
         logger.info("Starting live prediction...")
+        
+        # Start Hedge Bot Server
+        self.server_thread = threading.Thread(target=self.start_websocket_server, daemon=True)
+        self.server_thread.start()
         
         # Pre-fill buffer with historical data per symbol
         if historical_data is not None and not historical_data.empty:
@@ -1386,6 +1521,60 @@ class MarketPredictor:
             return current_signal
             
         return "WAIT"
+
+    # --- WEBSOCKET SERVER FOR HEDGE BOT ---
+    
+    async def websocket_handler(self, websocket):
+        """Handle incoming WebSocket connections from Hedge Bots"""
+        self.server_clients.add(websocket)
+        logger.info(f"Hedge Bot connected. Total clients: {len(self.server_clients)}")
+        try:
+            await websocket.wait_closed()
+        finally:
+            self.server_clients.remove(websocket)
+            logger.info(f"Hedge Bot disconnected. Total clients: {len(self.server_clients)}")
+
+    def start_websocket_server(self):
+        """Start the asyncio WebSocket server in a separate thread"""
+        logger.info("Starting Hedge Bot WebSocket Server on port 8765...")
+        
+        # Create a new event loop for this thread
+        self.server_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.server_loop)
+        
+        async def run_server():
+            # websockets.serve returns a Server object which is an async context manager
+            async with websockets.serve(self.websocket_handler, "0.0.0.0", 8765):
+                logger.info("WebSocket Server running...")
+                # Keep the server running indefinitely
+                await asyncio.Future() 
+
+        try:
+            self.server_loop.run_until_complete(run_server())
+        except Exception as e:
+            logger.error(f"WebSocket Server crashed: {e}")
+        finally:
+            self.server_loop.close()
+
+    def broadcast_hedge_data(self, data):
+        """Broadcast data to all connected WebSocket clients (Thread-Safe)"""
+        if not self.server_clients or not self.server_loop:
+            return
+
+        async def _send():
+            if not self.server_clients:
+                return
+            message = json.dumps(data)
+            # websockets.broadcast is available in newer versions, but loop iteration is safer for older ones
+            # or simply iterate
+            tasks = [asyncio.create_task(client.send(message)) for client in self.server_clients]
+            if tasks:
+                await asyncio.wait(tasks)
+
+        try:
+            asyncio.run_coroutine_threadsafe(_send(), self.server_loop)
+        except Exception as e:
+            logger.error(f"Error broadcasting hedge data: {e}")
 
 if __name__ == "__main__":
     logger.info(f"Initializing Market Predictor for symbols: {SYMBOLS}")

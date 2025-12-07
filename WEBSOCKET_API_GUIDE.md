@@ -6,6 +6,7 @@ This guide details the WebSocket endpoint provided by the Market Predictor Servi
 
 - **URL:** `ws://localhost:8765`
 - **Protocol:** WebSocket (WS)
+- **Authentication:** Bearer Token (Header: `Authorization: Bearer <TOKEN>`)
 - **Data Format:** JSON
 - **Update Frequency:** Real-time (triggered on every incoming trade message processed by the predictor)
 
@@ -150,7 +151,10 @@ import json
 
 async def hedge_bot():
     uri = "ws://localhost:8765"
-    async with websockets.connect(uri) as websocket:
+    token = "4kEZu6v_W5y2oNf8oZg2L1b3bO8hJ8mX" # Replace with your actual token
+    extra_headers = {"Authorization": f"Bearer {token}"}
+    
+    async with websockets.connect(uri, extra_headers=extra_headers) as websocket:
         print(f"Connected to {uri}")
         while True:
             message = await websocket.recv()

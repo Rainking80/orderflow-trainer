@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  trainer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: orderflow-trainer-gpu
+    pull_policy: build
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    volumes:
+      # Mount your current directory to /app so code changes are reflected instantly
+      - .:/app
+      # Avoid overwriting the container's installed packages with your local venv
+      - /app/.venv
+      - /app/.venv_tf24
+    command: python main.py
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    network_mode: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

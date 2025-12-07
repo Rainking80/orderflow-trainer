@@ -22,7 +22,7 @@ matplotlib.use('Agg')  # Use non-interactive backend
 import matplotlib.pyplot as plt
 import mplfinance as mpf
 import tensorflow as tf
-import tensorflow as tf
+
 from sklearn.preprocessing import MinMaxScaler
 import joblib
 
@@ -39,7 +39,8 @@ load_dotenv()
 
 BASE_URL = "http://localhost:8120"
 WS_URL = "ws://localhost:8120/ws/trade_groups"
-AUTH_TOKEN = os.getenv("AUTH_BEARER_TOKEN", "4kEZu6v_W5y2oNf8oZg2L1b3bO8hJ8mX")
+AUTH_TOKEN = os.getenv("AUTH_BEARER_TOKEN", "")
+AUTH_BEARER_TOKEN_OUTGOING = os.getenv("AUTH_BEARER_TOKEN_OUTGOING", "")
 
 # Symbols configuration
 SYMBOLS = os.getenv("SYMBOLS", "btcusdt").split(",")
@@ -74,7 +75,7 @@ class MarketPredictor:
         self.latest_data = {}  # symbol -> list of data
         self.lock = threading.RLock()
 
-        self.send_hourly_message = True
+        self.send_hourly_message = False
 
         self.PROB_THRESHOLD = 40.0  # If Pump/Dump > 40%, pay attention (even if Neutral is 50%)
         self.OFI_THRESHOLD = 0.5  # Minimum OFI strength to confirm the move
@@ -104,6 +105,7 @@ class MarketPredictor:
             self.last_lstm_predictions[symbol] = {'direction': 'N/A', 'probs': [0.0, 0.0, 0.0], 'pred_class': -1}
         
         self.market_regime = {} # Stores global market state (season, etc.)
+        self.last_midnight_report_time = None # Track last midnight report
         self.prediction_history = {s: [] for s in self.symbols} # Stores last N predictions for averaging
         self.initial_message_sent = False
         self.ENABLE_LSTM = True # Set to True to enable LSTM training
@@ -113,9 +115,19 @@ class MarketPredictor:
         self.server_clients = set()
         self.server_loop = None
         self.server_thread = None
+        
+        # Register signal handlers immediately to catch early termination
+        signal.signal(signal.SIGTERM, self.handle_exit)
+        signal.signal(signal.SIGINT, self.handle_exit)
 
     def handle_exit(self, signum, frame):
         logger.info(f"Received signal {signum}. Exiting gracefully...")
+        # Send shutdown notification
+        try:
+            self.send_telegram_message("🛑 <b>Service Stopped</b>\nReceived termination signal.")
+        except:
+            pass
+            
         if self.ws:
             self.ws.close()
         sys.exit(0)
@@ -214,7 +226,7 @@ class MarketPredictor:
                 df_all = df_all[df_all['symbol'].str.lower() == symbol.lower()].copy()
             
             if 'start_ts' in df_all.columns:
-                df_all['start_ts'] = pd.to_datetime(df_all['start_ts'])
+                df_all['start_ts'] = pd.to_datetime(df_all['start_ts'], utc=True)
                 df_all.set_index('start_ts', inplace=True)
                 
                 df_1m = df_all.resample('1min').agg({
@@ -331,7 +343,7 @@ class MarketPredictor:
                 df_all = df_all[df_all['symbol'].str.lower() == symbol.lower()].copy()
             
             # Handle mixed types
-            df_all['start_ts'] = pd.to_datetime(df_all['start_ts'])
+            df_all['start_ts'] = pd.to_datetime(df_all['start_ts'], utc=True)
             df_all.set_index('start_ts', inplace=True)
             
             # Resample to 1m
@@ -512,7 +524,7 @@ class MarketPredictor:
                     df_all = df_all[df_all['symbol'].str.lower() == symbol.lower()].copy()
                 
                 # Handle mixed types (strings from WS, datetimes from history)
-                df_all['start_ts'] = pd.to_datetime(df_all['start_ts'])
+                df_all['start_ts'] = pd.to_datetime(df_all['start_ts'], utc=True)
                 df_all.set_index('start_ts', inplace=True)
                 
                 # Resample to 1-hour candles
@@ -634,7 +646,7 @@ class MarketPredictor:
             
         df = pd.DataFrame(all_data)
         if not df.empty:
-            df['start_ts'] = pd.to_datetime(df['start_ts'], format='ISO8601')
+            df['start_ts'] = pd.to_datetime(df['start_ts'], utc=True)
             df = df.sort_values('start_ts').reset_index(drop=True)
             logger.info(f"Total records fetched: {len(df)}")
         else:
@@ -662,7 +674,7 @@ class MarketPredictor:
         
         # Ensure start_ts is datetime for time-based rolling
         if 'start_ts' in df.columns:
-            df['start_ts'] = pd.to_datetime(df['start_ts'], format='mixed')
+            df['start_ts'] = pd.to_datetime(df['start_ts'], utc=True)
             
             # Set index to start_ts for time-based rolling, but keep it as column
             # We sort just in case, though data should be sorted
@@ -695,33 +707,34 @@ class MarketPredictor:
         # Let's define "significant" as > 0.1% move
         
         future_window = 20
-        threshold = 0.001 # 0.1%
         
-        # Calculate future return
-        # We look at the max high and min low in the next window to catch volatility
-        indexer = pd.api.indexers.FixedForwardWindowIndexer(window_size=future_window)
-        df['future_high'] = df['high'].rolling(window=indexer).max()
-        df['future_low'] = df['low'].rolling(window=indexer).min()
-        
-        df['target'] = 0
-        
-        # If max high > current close * (1 + threshold) -> Buy Signal (1)
-        # If min low < current close * (1 - threshold) -> Sell Signal (-1)
-        # If both (high volatility), maybe 0 or prioritize one? Let's prioritize the first one that happens.
-        # For simplicity, let's just use close-to-close return for now to avoid lookahead bias complexity in labeling
-        
+        # Calculate future return (close-to-close)
         df['future_close'] = df['close'].shift(-future_window)
         df['future_return'] = (df['future_close'] - df['close']) / df['close']
         
+        # Dynamic Threshold: 1 Standard Deviation of future returns
+        # This automatically adapts to the specific asset's volatility (e.g. SOL vs BTC)
+        # We ensure a minimum floor of 0.1% (0.001) to ignore minimal noise during low vol
+        volatility_std = df['future_return'].std()
+        
+        if pd.isna(volatility_std):
+            threshold = 0.001
+        else:
+            # Stricter threshold: 1.5 std devs to filter more noise
+            threshold = max(0.001, volatility_std * 1.5)
+            
+        # Initialize target as Neutral (0)
+        df['target'] = 0
+        
+        # Apply Pump (1) and Dump (2) labels
         df.loc[df['future_return'] > threshold, 'target'] = 1
-        df.loc[df['future_return'] < -threshold, 'target'] = 2 # LightGBM likes 0, 1, 2...
-        # 0 = Neutral, 1 = Pump, 2 = Dump
+        df.loc[df['future_return'] < -threshold, 'target'] = 2 
         
         return df
 
     def get_model_file(self, symbol):
         """Get model filename for a specific symbol"""
-        return f"lgb_model_{symbol}_v2.txt"
+        return f"lgb_model_{symbol.upper()}_v6.txt"
     
     def load_model_if_valid(self, symbol, max_age_days=7):
         """Load model for a symbol if it exists and is younger than max_age_days"""
@@ -806,10 +819,10 @@ class MarketPredictor:
         return model
 
     def get_lstm_model_file(self, symbol):
-        return f"lstm_model_{symbol}.keras"
+        return f"lstm_model_{symbol.upper()}.keras"
 
     def get_lstm_scaler_file(self, symbol):
-        return f"lstm_scaler_{symbol}.pkl"
+        return f"lstm_scaler_{symbol.upper()}.pkl"
 
     def load_lstm_model_if_valid(self, symbol, max_age_days=3):
         """Load LSTM model and scaler if valid"""
@@ -855,6 +868,11 @@ class MarketPredictor:
                 logger.warning(f"Not enough data for LSTM training for {symbol}. Need at least 200 rows.")
                 return
 
+            # Limit data size to prevent OOM
+            if len(df) > 50000:
+                logger.info(f"Limiting LSTM training data to last 50,000 rows (Total: {len(df)}) to prevent OOM.")
+                df = df.iloc[-50000:]
+
             # Scale features
             scaler = MinMaxScaler()
             feature_data = df[self.feature_cols].values
@@ -886,7 +904,8 @@ class MarketPredictor:
             
             # Build model
             model = tf.keras.Sequential([
-                tf.keras.layers.LSTM(50, return_sequences=True, input_shape=(X_train.shape[1], X_train.shape[2])),
+                tf.keras.layers.Input(shape=(X_train.shape[1], X_train.shape[2])),
+                tf.keras.layers.LSTM(50, return_sequences=True),
                 tf.keras.layers.Dropout(0.2),
                 tf.keras.layers.LSTM(50, return_sequences=False),
                 tf.keras.layers.Dropout(0.2),
@@ -1203,6 +1222,15 @@ class MarketPredictor:
             confidence = (btc_dump_prob + avg_alt_pump_prob) / 2
             details = "BTC dumping while Alts pump. High risk."
             
+        else:
+            # 6. NEUTRAL / CHOPPY
+            season = "NEUTRAL"
+            # Confidence in neutrality can be seen as how "un-extreme" the signals are.
+            # We take the maximum signal strength seen so far and invert it.
+            max_signal = max(btc_pump_prob, btc_dump_prob, avg_alt_pump_prob, avg_alt_dump_prob, abs(btc_dominance_proxy))
+            confidence = 1.0 - min(max_signal, 1.0) 
+            details = "No strong trend detected. Market is ranging or indecisive."
+            
         # --- HEDGE FUND DATA BROADCAST ---
         # Calculate scores for the hedge bot
         
@@ -1304,10 +1332,14 @@ class MarketPredictor:
 
         # Check for change
         previous_season = self.market_regime.get("season", "NEUTRAL")
+        previous_dom_trend = self.market_regime.get("dominance_trend", "NEUTRAL")
+        
+        current_dom_trend = hedge_payload["btc_dominance"]["trend"]
         
         # Store state
         self.market_regime = {
             "season": season,
+            "dominance_trend": current_dom_trend,
             "confidence": confidence,
             "details": details,
             "metrics": {
@@ -1321,23 +1353,36 @@ class MarketPredictor:
         
         # Log significant changes
         if season != previous_season:
-            logger.info(f"Market Regime Change: {previous_season} -> {season} ({confidence:.2%}) - {details}")
-            # Send Telegram notification for season change
-            msg = f"🔄 <b>Market Regime Change</b>\n\n"
-            msg += f"Old: {previous_season}\n"
-            msg += f"New: <b>{season}</b>\n"
-            msg += f"Confidence: {confidence:.2%}\n"
-            msg += f"Details: {details}\n"
+            logger.info(f"Market Regime Change: {previous_season} -> {season} | Dom: {previous_dom_trend} -> {current_dom_trend}")
+            
+            # Send nice formatted message
+            msg = f"🔄 <b>Market Regime Update</b>\n\n"
+            if season != previous_season:
+                msg += f"Season: {previous_season} ➡️ <b>{season}</b>\n"
+            else:
+                msg += f"Season: <b>{season}</b> (Unchanged)\n"
+                
+            if current_dom_trend != previous_dom_trend:
+                msg += f"BTC Dominance: {previous_dom_trend} ➡️ <b>{current_dom_trend}</b>\n"
+            else:
+                msg += f"BTC Dominance: <b>{current_dom_trend}</b> (Unchanged)\n"
+            
+            msg += f"\nConfidence: {confidence:.2%}\n"
+            msg += f"Details: {details}\n\n"
+            msg += f"📋 <b>API Payload:</b>\n"
+            msg += f"<pre>{json.dumps(hedge_payload, indent=2)}</pre>"
+            
             self.send_telegram_message(msg)
+
+
         
         # Check for midnight report (once per day)
         current_time = datetime.now()
-        last_midnight = self.market_regime.get("last_midnight_report")
         
-        # If it's between 00:00 and 00:05 and we haven't sent it today
+        # If it's between 00:00 and 00:05
         if 0 <= current_time.hour < 1 and current_time.minute < 5:
             # Check if we already sent it today
-            if last_midnight is None or last_midnight.day != current_time.day:
+            if self.last_midnight_report_time is None or self.last_midnight_report_time.day != current_time.day:
                 logger.info("Sending midnight market regime report...")
                 msg = f"🌙 <b>Daily Market Regime Report</b>\n\n"
                 msg += f"Current Season: <b>{season}</b>\n"
@@ -1345,8 +1390,8 @@ class MarketPredictor:
                 msg += f"Details: {details}\n"
                 self.send_telegram_message(msg)
                 
-                # Update last report time in the dictionary (preserving other keys)
-                self.market_regime["last_midnight_report"] = current_time
+                # Update last report time
+                self.last_midnight_report_time = current_time
 
     def on_error(self, ws, error):
         logger.error(f"WebSocket Error: {error}")
@@ -1463,9 +1508,7 @@ class MarketPredictor:
         if AUTH_TOKEN:
             ws_headers["Authorization"] = f"Bearer {AUTH_TOKEN}"
 
-        # Register signal handlers for systemd/OS signals
-        signal.signal(signal.SIGTERM, self.handle_exit)
-        signal.signal(signal.SIGINT, self.handle_exit)
+        # Signal handlers are registered in __init__
 
         # Add symbols parameter to WebSocket URL
         ws_url_with_symbols = f"{WS_URL}?symbols={','.join(self.symbols)}"
@@ -1523,6 +1566,32 @@ class MarketPredictor:
     
     async def websocket_handler(self, websocket):
         """Handle incoming WebSocket connections from Hedge Bots"""
+        # 1. Authenticate
+        try:
+            # Get Authorization header
+            # Note: websocket.request_headers works in websockets library
+            auth_header = websocket.request_headers.get("Authorization", "")
+            
+            # Check format "Bearer <token>"
+            if not auth_header.startswith("Bearer "):
+                logger.warning(f"Rejected connection from {websocket.remote_address}: Missing or invalid Bearer header")
+                await websocket.close(code=1008, reason="Missing Authorization Header")
+                return
+                
+            # Check token
+            token = auth_header.split(" ")[1]
+            if token != AUTH_BEARER_TOKEN_OUTGOING:
+                logger.warning(f"Rejected connection from {websocket.remote_address}: Invalid token")
+                await websocket.close(code=1008, reason="Invalid Token")
+                return
+                
+            logger.info(f"Authenticated client connected from {websocket.remote_address}")
+            
+        except Exception as e:
+            logger.error(f"Authentication error: {e}")
+            await websocket.close(code=1011, reason="Internal Auth Error")
+            return
+
         self.server_clients.add(websocket)
         logger.info(f"Hedge Bot connected. Total clients: {len(self.server_clients)}")
         try:
@@ -1577,60 +1646,77 @@ if __name__ == "__main__":
     logger.info(f"Initializing Market Predictor for symbols: {SYMBOLS}")
     predictor = MarketPredictor(SYMBOLS)
     
-    # 1. Check for existing models and load them
-    models_loaded = {}
-    lstm_models_loaded = {}
+    # Notify Start
+    try:
+        predicted_start_msg = f"🟢 <b>Service Starting</b>\nSymbols: {', '.join([s.upper() for s in SYMBOLS])}"
+        predictor.send_telegram_message(predicted_start_msg)
+    except:
+        pass
     
-    for symbol in SYMBOLS:
-        models_loaded[symbol] = predictor.load_model_if_valid(symbol, max_age_days=2)
-        if models_loaded[symbol]:
-            logger.info(f"✓ LGBM Model loaded for {symbol}")
-        else:
-            logger.info(f"✗ LGBM Model not found or too old for {symbol}")
-            
-        # Check LSTM
-        lstm_models_loaded[symbol] = predictor.load_lstm_model_if_valid(symbol, max_age_days=3)
-        if lstm_models_loaded[symbol]:
-            logger.info(f"✓ LSTM Model loaded for {symbol}")
-        else:
-            logger.info(f"✗ LSTM Model not found or too old for {symbol}")
-    
-    # 2. Fetch Data
-    # If all models are loaded, we just need enough data for the buffer (e.g. 2 days)
-    # If we need to train any model, we fetch more (e.g. 5 days)
-    all_lgbm_loaded = all(models_loaded.values())
-    all_lstm_loaded = all(lstm_models_loaded.values()) if predictor.ENABLE_LSTM else True
-    
-    days_to_fetch = 2 if (all_lgbm_loaded and all_lstm_loaded) else 5
-    
-    logger.info(f"Fetching {days_to_fetch} days of historical data...")
-    df = predictor.fetch_historical_data(SYMBOLS, days=days_to_fetch)
-    
-    if not df.empty and len(df) > 10:
-        # 3. Train Models if needed (per symbol)
-        for symbol in SYMBOLS:
-            # Filter data for this symbol
-            symbol_df = df[df['symbol'] == symbol.upper()].copy()
-            
-            if not models_loaded[symbol]:
-                logger.info(f"Training LGBM model for {symbol.upper()}...")
-                if len(symbol_df) > 10:
-                    predictor.train_model(symbol.upper(), symbol_df)
-                    logger.info(f"✓ LGBM Model trained for {symbol.upper()}")
-                else:
-                    logger.warning(f"✗ Not enough data for {symbol.upper()}. Skipping LGBM training.")
-            
-            # Train LSTM if enabled and not loaded
-            if predictor.ENABLE_LSTM and not lstm_models_loaded[symbol]:
-                predictor.train_lstm_model(symbol.upper(), symbol_df)
+    try:
+        # 1. Check for existing models and load them
+        models_loaded = {}
+        lstm_models_loaded = {}
         
+        for symbol in SYMBOLS:
+            models_loaded[symbol] = predictor.load_model_if_valid(symbol, max_age_days=2)
+            if models_loaded[symbol]:
+                logger.info(f"✓ LGBM Model loaded for {symbol}")
+            else:
+                logger.info(f"✗ LGBM Model not found or too old for {symbol}")
+                
+            # Check LSTM
+            lstm_models_loaded[symbol] = predictor.load_lstm_model_if_valid(symbol, max_age_days=3)
+            if lstm_models_loaded[symbol]:
+                logger.info(f"✓ LSTM Model loaded for {symbol}")
+            else:
+                logger.info(f"✗ LSTM Model not found or too old for {symbol}")
+        
+        # 2. Fetch Data
+        # If all models are loaded, we just need enough data for the buffer (e.g. 2 days)
+        # If we need to train any model, we fetch more (e.g. 5 days)
+        all_lgbm_loaded = all(models_loaded.values())
+        all_lstm_loaded = all(lstm_models_loaded.values()) if predictor.ENABLE_LSTM else True
+        
+        days_to_fetch = 2 if (all_lgbm_loaded and all_lstm_loaded) else 5
+        
+        logger.info(f"Fetching {days_to_fetch} days of historical data...")
+        df = predictor.fetch_historical_data(SYMBOLS, days=days_to_fetch)
+        
+        if not df.empty and len(df) > 10:
+            # 3. Train Models if needed (per symbol)
+            for symbol in SYMBOLS:
+                # Filter data for this symbol
+                symbol_df = df[df['symbol'] == symbol.upper()].copy()
+                
+                if not models_loaded[symbol]:
+                    logger.info(f"Training LGBM model for {symbol.upper()}...")
+                    if len(symbol_df) > 10:
+                        predictor.train_model(symbol.upper(), symbol_df)
+                        logger.info(f"✓ LGBM Model trained for {symbol.upper()}")
+                    else:
+                        logger.warning(f"✗ Not enough data for {symbol.upper()}. Skipping LGBM training.")
+                
+                # Train LSTM if enabled and not loaded
+                if predictor.ENABLE_LSTM and not lstm_models_loaded[symbol]:
+                    predictor.train_lstm_model(symbol.upper(), symbol_df)
+        else:
+            logger.warning(f"Not enough historical data fetched ({len(df)} records). Starting without pre-filling buffer.")
+            
         # 4. Live Predict
+        predictor.start_live_prediction(df)
+        
+    except KeyboardInterrupt:
+        logger.info("Stopping...")
         try:
-            predictor.start_live_prediction(df)
-        except KeyboardInterrupt:
-            logger.info("Stopping...")
-        except Exception as e:
-            logger.error(f"Fatal error: {e}")
-            sys.exit(1) # Exit with error code so systemd knows it failed
-    else:
-        logger.warning(f"Not enough data. Fetched {len(df)} records.")
+            predictor.send_telegram_message("🛑 <b>Service Stopped</b>\nKeyboard Interrupt.")
+        except:
+            pass
+    except Exception as e:
+        logger.error(f"Fatal Service Error: {e}", exc_info=True)
+        try:
+            predictor.send_telegram_message(f"☠️ <b>Service Died</b>\nError: {str(e)}")
+        except:
+            pass
+        sys.exit(1)
+

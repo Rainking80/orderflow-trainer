@@ -50,6 +50,22 @@ SYMBOLS = [s.strip().lower() for s in SYMBOLS]  # Normalize symbols
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
+def _parse_dates(df):
+    """Helper to parse dates robustly for old pandas (compatible with pandas<1.3.0)"""
+    if 'start_ts' in df.columns:
+        # For old pandas versions, normalize timestamps to always include fractional seconds
+        # This handles both "2025-12-08T20:02:01Z" and "2025-12-08T20:02:01.123456Z"
+        if df['start_ts'].dtype == object:
+            # Add .000000 to timestamps without fractional seconds
+            df['start_ts'] = df['start_ts'].astype(str).str.replace(
+                r'T(\d{2}:\d{2}:\d{2})Z$', 
+                r'T\1.000000Z', 
+                regex=True
+            )
+        df['start_ts'] = pd.to_datetime(df['start_ts'], utc=True)
+    return df
+
+
 class MarketPredictor:
     def __init__(self, symbols):
         """
@@ -116,12 +132,25 @@ class MarketPredictor:
         self.server_loop = None
         self.server_thread = None
         
+        # Automatic Retraining Scheduler
+        self.retraining_thread = None
+        self.retraining_stop_event = threading.Event()
+        self.RETRAIN_CHECK_INTERVAL = 24 * 60 * 60  # Check every 24 hours (in seconds)
+        self.RETRAIN_MAX_AGE_DAYS = 7  # Retrain if model is >= 7 days old
+        
         # Register signal handlers immediately to catch early termination
         signal.signal(signal.SIGTERM, self.handle_exit)
         signal.signal(signal.SIGINT, self.handle_exit)
 
     def handle_exit(self, signum, frame):
         logger.info(f"Received signal {signum}. Exiting gracefully...")
+        
+        # Stop the retraining scheduler thread
+        if self.retraining_thread and self.retraining_thread.is_alive():
+            logger.info("Stopping retraining scheduler...")
+            self.retraining_stop_event.set()
+            self.retraining_thread.join(timeout=5)
+        
         # Send shutdown notification
         try:
             self.send_telegram_message("🛑 <b>Service Stopped</b>\nReceived termination signal.")
@@ -226,7 +255,7 @@ class MarketPredictor:
                 df_all = df_all[df_all['symbol'].str.lower() == symbol.lower()].copy()
             
             if 'start_ts' in df_all.columns:
-                df_all['start_ts'] = pd.to_datetime(df_all['start_ts'], utc=True)
+                df_all = self._parse_dates(df_all)
                 df_all.set_index('start_ts', inplace=True)
                 
                 df_1m = df_all.resample('1min').agg({
@@ -343,7 +372,7 @@ class MarketPredictor:
                 df_all = df_all[df_all['symbol'].str.lower() == symbol.lower()].copy()
             
             # Handle mixed types
-            df_all['start_ts'] = pd.to_datetime(df_all['start_ts'], utc=True)
+            df_all = self._parse_dates(df_all)
             df_all.set_index('start_ts', inplace=True)
             
             # Resample to 1m
@@ -524,7 +553,7 @@ class MarketPredictor:
                     df_all = df_all[df_all['symbol'].str.lower() == symbol.lower()].copy()
                 
                 # Handle mixed types (strings from WS, datetimes from history)
-                df_all['start_ts'] = pd.to_datetime(df_all['start_ts'], utc=True)
+                df_all = self._parse_dates(df_all)
                 df_all.set_index('start_ts', inplace=True)
                 
                 # Resample to 1-hour candles
@@ -595,60 +624,162 @@ class MarketPredictor:
         except Exception as e:
             logger.error(f"Error in generate_nightly_charts: {e}")
 
-    def fetch_historical_data(self, symbols, days=3):
-        logger.info(f"Fetching data for symbols {symbols} for the last {days} days in 3 requests...")
+    def _parse_dates(self, df):
+        """Helper to parse dates robustly for old pandas (compatible with pandas<1.3.0)"""
+        if 'start_ts' in df.columns:
+            # Handle mixed timestamp formats (ISO format with Z, space-separated with timezone offset, etc.)
+            # Skip conversion if already datetime
+            if df['start_ts'].dtype == object:
+                # Three-step normalization for consistent parsing:
+                # 1. Replace 'Z' suffix with '+00:00' (normalize timezone suffix)
+                df['start_ts'] = df['start_ts'].astype(str).str.replace('Z', '+00:00', regex=False)
+                # 2. Replace 'T' with space (normalize date-time separator)
+                df['start_ts'] = df['start_ts'].astype(str).str.replace('T', ' ', regex=False)
+                # 3. Add '.000000' to timestamps without fractional seconds
+                df['start_ts'] = df['start_ts'].astype(str).str.replace(
+                    r'(\d{2}:\d{2}:\d{2})(\+)',
+                    r'\1.000000\2',
+                    regex=True
+                )
+                # Parse timestamps
+                df['start_ts'] = pd.to_datetime(df['start_ts'], errors='coerce')
+                # Ensure UTC timezone
+                if df['start_ts'].dt.tz is None:
+                    df['start_ts'] = df['start_ts'].dt.tz_localize('UTC')
+                else:
+                    df['start_ts'] = df['start_ts'].dt.tz_convert('UTC')
+            elif not pd.api.types.is_datetime64_any_dtype(df['start_ts']):
+                # Handle other non-datetime types
+                df['start_ts'] = pd.to_datetime(df['start_ts'], errors='coerce')
+                if df['start_ts'].dt.tz is None:
+                    df['start_ts'] = df['start_ts'].dt.tz_localize('UTC')
+            else:
+                # Already datetime, ensure timezone-aware
+                if df['start_ts'].dt.tz is None:
+                    df['start_ts'] = df['start_ts'].dt.tz_localize('UTC')
+                elif str(df['start_ts'].dt.tz) != 'UTC':
+                    df['start_ts'] = df['start_ts'].dt.tz_convert('UTC')
+        return df
+
+    def fetch_historical_data(self, symbols, days=7, fetch_golden=True, golden_days=365):
+        logger.info(f"Fetching data for symbols {symbols}...")
         all_data = []
-        end_time = datetime.now(timezone.utc)
-        start_time = end_time - timedelta(days=days)
+        seen_keys = set() # (symbol, start_ts)
         
-        # Calculate the time interval for each of the 3 requests
-        total_duration = end_time - start_time
+        headers = {}
+        if AUTH_TOKEN:
+            headers["Authorization"] = f"Bearer {AUTH_TOKEN}"
+        headers["Accept-Encoding"] = "gzip, deflate"
+
+        # Helper to process response line items
+        def process_response(response, source_desc=""):
+            count = 0
+            for line in response.iter_lines():
+                if line:
+                    try:
+                        item = json.loads(line.decode('utf-8'))
+                        # Create unique key
+                        sym = item.get('symbol')
+                        ts = item.get('start_ts')
+                        if sym and ts:
+                            # Normalize symbol to ensure uniqueness match
+                            # Trade groups usually return lowercase symbol
+                            key = (str(sym).lower(), ts)
+                            if key not in seen_keys:
+                                seen_keys.add(key)
+                                all_data.append(item)
+                                count += 1
+                    except json.JSONDecodeError:
+                        continue
+            logger.info(f"Fetched {count} new unique records from {source_desc}")
+
+        # 1. Fetch Golden Dataset
+        if fetch_golden:
+            logger.info(f"Fetching Golden Dataset events (last {golden_days} days)...")
+            try:
+                golden_endpoint = f"{BASE_URL}/golden_dataset"
+                # Define window for golden dataset (configurable via golden_days parameter)
+                golden_end_time = datetime.now(timezone.utc)
+                golden_start_time = golden_end_time - timedelta(days=golden_days)
+                
+                g_start_str = golden_start_time.strftime("%Y-%m-%dT%H:%M:%SZ")
+                g_end_str = golden_end_time.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+                for symbol in symbols:
+                    # Get events with date filter
+                    params = {
+                        'symbol': symbol,
+                        'start_time': g_start_str,
+                        'end_time': g_end_str
+                    }
+                    resp = requests.get(golden_endpoint, params=params, headers=headers)
+                    if resp.status_code == 200:
+                        events = resp.json()
+                        logger.info(f"Found {len(events)} golden events for {symbol}")
+                        
+                        for i, event in enumerate(events):
+                            start_str = event.get('start_time')
+                            end_str = event.get('end_time')
+                            
+                            if start_str and end_str:
+                                try:
+                                    # Convert to datetime to handle formatting
+                                    s_dt = pd.to_datetime(start_str).astimezone(timezone.utc)
+                                    e_dt = pd.to_datetime(end_str).astimezone(timezone.utc)
+                                    
+                                    # Fetch trade groups for this event
+                                    params = {
+                                        'start': s_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                        'end': e_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                        'symbols': symbol
+                                    }
+                                    
+                                    r = requests.get(f"{BASE_URL}/download/trade_groups", params=params, headers=headers, stream=True)
+                                    r.raise_for_status()
+                                    process_response(r, f"Golden Event {i+1} ({event.get('reason', 'Unknown')}) for {symbol}")
+                                except Exception as e:
+                                    logger.error(f"Error fetching data for golden event {i}: {e}")
+                    elif resp.status_code == 404:
+                        logger.info(f"No golden dataset found for {symbol}")
+                    else:
+                        logger.warning(f"Failed to fetch golden events for {symbol}: {resp.status_code}")
+            except Exception as e:
+                logger.error(f"Error in golden dataset fetch phase: {e}")
+        else:
+            logger.info("Skipping Golden Dataset fetch (Models are up to date).")
+
+        # 2. Fetch Last N Days (Training Data)
+        logger.info(f"Fetching last {days} days of training data...")
+        end_time = datetime.now(timezone.utc)
+        start_time_days = end_time - timedelta(days=days)
+        
+        # Split into 3 chunks
+        total_duration = end_time - start_time_days
         chunk_duration = total_duration / 3
         
-        # Always make exactly 3 requests
         for i in range(3):
-            # Calculate time range for this chunk
             chunk_end = end_time - (chunk_duration * i)
             chunk_start = chunk_end - chunk_duration
             
             params = {
                 'start': chunk_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 'end': chunk_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                'symbols': ','.join(symbols)  # Add symbols parameter
+                'symbols': ','.join(symbols)
             }
             
             try:
-                logger.info(f"Request {i+1}/3: Downloading data from {params['start']} to {params['end']}...")
-                headers = {}
-                if AUTH_TOKEN:
-                    headers["Authorization"] = f"Bearer {AUTH_TOKEN}"
-                
-                # Explicitly request gzip to avoid zstd issues if any
-                headers["Accept-Encoding"] = "gzip, deflate"
-
-                response = requests.get(f"{BASE_URL}/download/trade_groups", params=params, headers=headers, stream=True)
-                response.raise_for_status()
-                
-                # Handle NDJSON
-                for line in response.iter_lines():
-                    if line:
-                        try:
-                            # Decode bytes to string and parse JSON
-                            decoded_line = line.decode('utf-8')
-                            item = json.loads(decoded_line)
-                            all_data.append(item)
-                        except json.JSONDecodeError as e:
-                            logger.error(f"JSON decode error: {e}")
-                            continue
-                        
+                logger.info(f"Request {i+1}/3: Downloading from {params['start']} to {params['end']}...")
+                r = requests.get(f"{BASE_URL}/download/trade_groups", params=params, headers=headers, stream=True)
+                r.raise_for_status()
+                process_response(r, f"Training Data Chunk {i+1}")
             except Exception as e:
-                logger.error(f"Error fetching data: {e}")
-            
+                logger.error(f"Error fetching chunk {i+1}: {e}")
+
         df = pd.DataFrame(all_data)
         if not df.empty:
-            df['start_ts'] = pd.to_datetime(df['start_ts'], utc=True)
+            df = self._parse_dates(df)
             df = df.sort_values('start_ts').reset_index(drop=True)
-            logger.info(f"Total records fetched: {len(df)}")
+            logger.info(f"Total compiled records: {len(df)}")
         else:
             logger.warning("No data fetched.")
             
@@ -673,8 +804,8 @@ class MarketPredictor:
         df['rsi'] = self.calculate_rsi(df['close'])
         
         # Ensure start_ts is datetime for time-based rolling
+        df = self._parse_dates(df)
         if 'start_ts' in df.columns:
-            df['start_ts'] = pd.to_datetime(df['start_ts'], utc=True)
             
             # Set index to start_ts for time-based rolling, but keep it as column
             # We sort just in case, though data should be sorted
@@ -926,6 +1057,140 @@ class MarketPredictor:
             
         except Exception as e:
             logger.error(f"Error training LSTM for {symbol}: {e}")
+
+    def check_model_age(self, symbol, model_type='lgbm'):
+        """
+        Check if a model needs retraining based on age.
+        Returns (needs_retrain, age_days)
+        """
+        try:
+            if model_type == 'lgbm':
+                model_file = self.get_model_file(symbol)
+            else:  # lstm
+                model_file = self.get_lstm_model_file(symbol)
+            
+            if not os.path.exists(model_file):
+                logger.info(f"{model_type.upper()} model for {symbol} does not exist. Needs training.")
+                return (True, None)
+            
+            file_time = os.path.getmtime(model_file)
+            file_age = datetime.now() - datetime.fromtimestamp(file_time)
+            age_days = file_age.days
+            
+            if age_days >= self.RETRAIN_MAX_AGE_DAYS:
+                logger.info(f"{model_type.upper()} model for {symbol} is {age_days} days old (>= {self.RETRAIN_MAX_AGE_DAYS}). Needs retraining.")
+                return (True, age_days)
+            
+            return (False, age_days)
+        except Exception as e:
+            logger.error(f"Error checking model age for {symbol} ({model_type}): {e}")
+            return (False, None)
+
+    def background_retrain_check(self):
+        """
+        Background thread function that periodically checks model ages and triggers retraining.
+        Runs every RETRAIN_CHECK_INTERVAL seconds.
+        """
+        logger.info(f"Background retraining scheduler started. Checking every {self.RETRAIN_CHECK_INTERVAL / 3600:.1f} hours for models >= {self.RETRAIN_MAX_AGE_DAYS} days old.")
+        
+        while not self.retraining_stop_event.is_set():
+            # Wait for the check interval (or until stop event is set)
+            if self.retraining_stop_event.wait(timeout=self.RETRAIN_CHECK_INTERVAL):
+                break  # Stop event was set
+            
+            logger.info("Running scheduled model age check...")
+            
+            try:
+                # Check each symbol's models
+                symbols_needing_retrain = {'lgbm': [], 'lstm': []}
+                
+                for symbol in self.symbols:
+                    # Check LGBM model
+                    needs_retrain_lgbm, age_lgbm = self.check_model_age(symbol, 'lgbm')
+                    if needs_retrain_lgbm:
+                        symbols_needing_retrain['lgbm'].append(symbol)
+                    
+                    # Check LSTM model (if enabled)
+                    if self.ENABLE_LSTM:
+                        needs_retrain_lstm, age_lstm = self.check_model_age(symbol, 'lstm')
+                        if needs_retrain_lstm:
+                            symbols_needing_retrain['lstm'].append(symbol)
+                
+                # If any models need retraining, fetch data and retrain
+                if symbols_needing_retrain['lgbm'] or symbols_needing_retrain['lstm']:
+                    logger.info(f"Models needing retraining - LGBM: {symbols_needing_retrain['lgbm']}, LSTM: {symbols_needing_retrain['lstm']}")
+                    
+                    # Send Telegram notification
+                    try:
+                        retrain_msg = f"🔄 <b>Automatic Retraining Triggered</b>\n"
+                        if symbols_needing_retrain['lgbm']:
+                            retrain_msg += f"LGBM: {', '.join([s.upper() for s in symbols_needing_retrain['lgbm']])}\n"
+                        if symbols_needing_retrain['lstm']:
+                            retrain_msg += f"LSTM: {', '.join([s.upper() for s in symbols_needing_retrain['lstm']])}"
+                        self.send_telegram_message(retrain_msg)
+                    except Exception as e:
+                        logger.error(f"Failed to send retraining notification: {e}")
+                    
+                    # Fetch data for retraining (5 days + golden dataset)
+                    logger.info("Fetching historical data for retraining...")
+                    df = self.fetch_historical_data(self.symbols, days=5, fetch_golden=True)
+                    
+                    if not df.empty and len(df) > 10:
+                        # Retrain LGBM models
+                        for symbol in symbols_needing_retrain['lgbm']:
+                            symbol_df = df[df['symbol'] == symbol.upper()].copy()
+                            if len(symbol_df) > 10:
+                                logger.info(f"Retraining LGBM model for {symbol.upper()}...")
+                                self.train_model(symbol.upper(), symbol_df)
+                                logger.info(f"✓ LGBM Model retrained for {symbol.upper()}")
+                            else:
+                                logger.warning(f"Not enough data for {symbol.upper()}. Skipping LGBM retraining.")
+                        
+                        # Retrain LSTM models
+                        if self.ENABLE_LSTM:
+                            for symbol in symbols_needing_retrain['lstm']:
+                                symbol_df = df[df['symbol'] == symbol.upper()].copy()
+                                if len(symbol_df) > 200:
+                                    logger.info(f"Retraining LSTM model for {symbol.upper()}...")
+                                    self.train_lstm_model(symbol.upper(), symbol_df)
+                                    logger.info(f"✓ LSTM Model retrained for {symbol.upper()}")
+                                else:
+                                    logger.warning(f"Not enough data for {symbol.upper()}. Skipping LSTM retraining.")
+                        
+                        # Send completion notification
+                        try:
+                            completion_msg = "✅ <b>Automatic Retraining Completed</b>"
+                            self.send_telegram_message(completion_msg)
+                        except:
+                            pass
+                    else:
+                        logger.warning("Not enough historical data fetched for retraining.")
+                        try:
+                            self.send_telegram_message("⚠️ <b>Retraining Failed</b>\nNot enough historical data.")
+                        except:
+                            pass
+                else:
+                    logger.info("All models are up to date. No retraining needed.")
+                    
+            except Exception as e:
+                logger.error(f"Error in background retraining check: {e}", exc_info=True)
+                try:
+                    self.send_telegram_message(f"❌ <b>Retraining Error</b>\n{str(e)}")
+                except:
+                    pass
+        
+        logger.info("Background retraining scheduler stopped.")
+
+    def start_retraining_scheduler(self):
+        """Start the background retraining scheduler thread"""
+        if self.retraining_thread is not None and self.retraining_thread.is_alive():
+            logger.warning("Retraining scheduler thread is already running.")
+            return
+        
+        self.retraining_stop_event.clear()
+        self.retraining_thread = threading.Thread(target=self.background_retrain_check, daemon=True, name="RetrainingScheduler")
+        self.retraining_thread.start()
+        logger.info("Retraining scheduler thread started.")
 
     def on_message(self, ws, message):
         # Skip empty or non-string messages
@@ -1679,9 +1944,10 @@ if __name__ == "__main__":
         all_lstm_loaded = all(lstm_models_loaded.values()) if predictor.ENABLE_LSTM else True
         
         days_to_fetch = 2 if (all_lgbm_loaded and all_lstm_loaded) else 5
+        fetch_golden = not (all_lgbm_loaded and all_lstm_loaded)
         
-        logger.info(f"Fetching {days_to_fetch} days of historical data...")
-        df = predictor.fetch_historical_data(SYMBOLS, days=days_to_fetch)
+        logger.info(f"Fetching {days_to_fetch} days of historical data... (Fetch Golden: {fetch_golden})")
+        df = predictor.fetch_historical_data(SYMBOLS, days=days_to_fetch, fetch_golden=fetch_golden)
         
         if not df.empty and len(df) > 10:
             # 3. Train Models if needed (per symbol)
@@ -1702,8 +1968,12 @@ if __name__ == "__main__":
                     predictor.train_lstm_model(symbol.upper(), symbol_df)
         else:
             logger.warning(f"Not enough historical data fetched ({len(df)} records). Starting without pre-filling buffer.")
+        
+        # 4. Start Automatic Retraining Scheduler
+        logger.info("Starting automatic retraining scheduler (checks every 24 hours for models >= 7 days old)...")
+        predictor.start_retraining_scheduler()
             
-        # 4. Live Predict
+        # 5. Live Predict
         predictor.start_live_prediction(df)
         
     except KeyboardInterrupt:

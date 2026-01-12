@@ -12,21 +12,23 @@ import io
 import os
 import sys
 import signal
-import logging
+
 from datetime import datetime, timedelta, timezone
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report
+from sklearn.metrics import classification_report, accuracy_score, precision_score, f1_score, recall_score
 from dotenv import load_dotenv
 import matplotlib
-matplotlib.use('Agg')  # Use non-interactive backend
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import mplfinance as mpf
-import tensorflow as tf
-
-from sklearn.preprocessing import MinMaxScaler
+import seaborn as sns
 import joblib
+from paper_trader import PaperTradeManager
+from orderflow_strategy import OrderFlowStrategy
 
-# Configure logging for systemd
+from dataset_labeler import DatasetLabeler
+
+# Configure logging
+import logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -34,7 +36,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Load environment variables
 load_dotenv()
 
 BASE_URL = "http://localhost:8120"
@@ -42,1621 +43,1157 @@ WS_URL = "ws://localhost:8120/ws/trade_groups"
 AUTH_TOKEN = os.getenv("AUTH_BEARER_TOKEN", "")
 AUTH_BEARER_TOKEN_OUTGOING = os.getenv("AUTH_BEARER_TOKEN_OUTGOING", "")
 
-# Symbols configuration
-SYMBOLS = os.getenv("SYMBOLS", "btcusdt").split(",")
-SYMBOLS = [s.strip().lower() for s in SYMBOLS]  # Normalize symbols
-
-# Telegram configuration
+# Configuration
+SYMBOLS = [s.strip().lower() for s in os.getenv("SYMBOLS", "btcusdt").split(",")]
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-def _parse_dates(df):
-    """Helper to parse dates robustly for old pandas (compatible with pandas<1.3.0)"""
-    if 'start_ts' in df.columns:
-        # For old pandas versions, normalize timestamps to always include fractional seconds
-        # This handles both "2025-12-08T20:02:01Z" and "2025-12-08T20:02:01.123456Z"
-        if df['start_ts'].dtype == object:
-            # Add .000000 to timestamps without fractional seconds
-            df['start_ts'] = df['start_ts'].astype(str).str.replace(
-                r'T(\d{2}:\d{2}:\d{2})Z$', 
-                r'T\1.000000Z', 
-                regex=True
-            )
-        df['start_ts'] = pd.to_datetime(df['start_ts'], utc=True)
-    return df
-
+# Meta-Model Configuration
+META_CONFIDENCE_THRESHOLD = 0.56  # Only trade if Meta-Model is 65% sure
+PRIMARY_Z_SCORE_THRESHOLD = 2.0  # Trigger primary signal at 1.5 Std Dev
+PAPER_TRADING_FEE = 0.001
 
 class MarketPredictor:
     def __init__(self, symbols):
-        """
-        Initialize predictor for multiple symbols
-        Args:
-            symbols: List of symbol strings (e.g., ['btcusdt', 'ethusdt', 'solusdt'])
-        """
         self.symbols = symbols
-        self.models = {}  # symbol -> model
-        self.lstm_models = {} # symbol -> lstm model
-        self.lstm_scalers = {} # symbol -> scaler
-        self.lstm_prediction_counters = {} # symbol -> int
-        self.last_lstm_predictions = {} # symbol -> dict
+        self.meta_models = {}  # symbol -> lgb.Booster
+
+        # Features MUST match dataset_labeler.py exactly
         self.feature_cols = [
-            'delta', 'delta_pct', 'total_volume', 'trade_count', 
-            'buy_volume', 'sell_volume', 'vwap', 'price_range',
-            'large_trade_dominance', 'ratio_buy_sell_trades',
-            'rsi', 'volatility', 'return',
-            'ofi_sum_10s', 'ofi_sum_60s', 'ofi_sum_300s',
-            'ofi_lag_1', 'ofi_lag_2', 'ofi_lag_3', 'ofi_lag_5'
+            'volatility_20', 'volume_ratio', 'rsi', 'flow_z_score',
+            'momentum_5', 'momentum_10', 'momentum_20',
+            'price_to_ma20', 'price_to_ma50', 'ma_20_50_diff',
+            'log_duration', 'trades_per_second', 'duration_z_score',
+            'delta_ratio', 'delta_pct', 'min_max_delta_ratio',
+            'cumulative_delta_divergence', 'consecutive_delta', 'cvd_momentum',
+            'whale_dominance', 'large_trade_ratio',
+            'efficiency_ratio', 'close_location',
         ]
-        self.running = False
-        self.latest_data = {}  # symbol -> list of data
+
+        # Buffer for live data
+        self.latest_data = {s: [] for s in self.symbols}
+        self.buffers_ready = False  # Flag to indicate buffers are populated with historical data
         self.lock = threading.RLock()
-
-        self.send_hourly_message = False
-
-        self.PROB_THRESHOLD = 40.0  # If Pump/Dump > 40%, pay attention (even if Neutral is 50%)
-        self.OFI_THRESHOLD = 0.5  # Minimum OFI strength to confirm the move
-        self.CONSECUTIVE_SIGNAL_THRESHOLD = 3  # Number of consecutive signals required to trigger
-        
-        # Telegram notification tracking per symbol
-        self.previous_probs = {}  # symbol -> {'NEUTRAL': 0.0, 'PUMP': 0.0, 'DUMP': 0.0}
-        self.last_hourly_message_time = None  # Global timestamp for hourly updates
-        self.last_prediction_data = {}  # symbol -> prediction dict
-        self.active_events = {}  # symbol -> {'NEUTRAL': False, 'PUMP': False, 'DUMP': False}
-        self.signal_counters = {}  # symbol -> {'type': 'WAIT', 'count': 0}
-        self.last_nightly_chart_time = None  # Track last nightly chart generation
-        
-        # Batching for threshold crossing alerts
-        self.pending_alerts = []  # List of (symbol, category) tuples
-        self.alert_batch_timer = None  # Timer for sending batched alerts
-        self.alert_batch_delay = 2.0  # Wait 2 seconds to batch alerts from multiple symbols
-        
-        # Initialize per-symbol data structures
-        for symbol in self.symbols:
-            self.latest_data[symbol] = []
-            self.previous_probs[symbol] = {'NEUTRAL': 0.0, 'PUMP': 0.0, 'DUMP': 0.0}
-            self.last_prediction_data[symbol] = None
-            self.active_events[symbol] = {'NEUTRAL': False, 'PUMP': False, 'DUMP': False}
-            self.signal_counters[symbol] = {'type': 'WAIT', 'count': 0}
-            self.lstm_prediction_counters[symbol] = 0
-            self.last_lstm_predictions[symbol] = {'direction': 'N/A', 'probs': [0.0, 0.0, 0.0], 'pred_class': -1}
-        
-        self.market_regime = {} # Stores global market state (season, etc.)
-        self.last_midnight_report_time = None # Track last midnight report
-        self.prediction_history = {s: [] for s in self.symbols} # Stores last N predictions for averaging
-        self.initial_message_sent = False
-        self.ENABLE_LSTM = True # Set to True to enable LSTM training
         self.ws = None
-        
-        # Hedge Fund WebSocket Server
+        self.running = True
+
+        self.retrain_thread = None
+
+        # Shadow Ledger for tracking trades locally
+        self.active_trades = {}
+
+        self.paper_trader = PaperTradeManager(
+            initial_balance=1000.0,
+            stop_loss_pct=0.004,  # 0.4% Hard Stop
+            trailing_stop_pct=0.0015,  # 0.15% Trailing
+            fee_pct=PAPER_TRADING_FEE,  # 0.1% Fees
+            leverage=10,  # 10x Leverage
+            entry_threshold=META_CONFIDENCE_THRESHOLD,  # Normaler Einstieg
+            reversal_threshold=0.65,  # Harte Flip-Regel
+            cooldown_seconds=60,  # Fast turnover (60s)
+            on_trade_open_callback=self.send_telegram_message,  # Just send message on open
+            on_trade_close_callback=self.on_trade_closed  # Send message + check charts on close
+        )
+
+        # Server for Hedge Bot
         self.server_clients = set()
         self.server_loop = None
         self.server_thread = None
+
+        # Order Flow Strategy for signal detection
+        self.orderflow_strategy = OrderFlowStrategy(
+            divergence_lookback=20,
+            absorption_volume_std=2.0,
+            absorption_range_factor=0.5,
+            momentum_std=1.5
+        )
+        self.last_orderflow_signal = {s: None for s in self.symbols}  # Track last signal per symbol
+        self.orderflow_signal_cooldown = {s: None for s in self.symbols}  # Cooldown tracking
         
-        # Automatic Retraining Scheduler
-        self.retraining_thread = None
-        self.retraining_stop_event = threading.Event()
-        self.RETRAIN_CHECK_INTERVAL = 24 * 60 * 60  # Check every 24 hours (in seconds)
-        self.RETRAIN_MAX_AGE_DAYS = 7  # Retrain if model is >= 7 days old
-        
-        # Register signal handlers immediately to catch early termination
+        # Graceful Exit
         signal.signal(signal.SIGTERM, self.handle_exit)
         signal.signal(signal.SIGINT, self.handle_exit)
 
     def handle_exit(self, signum, frame):
-        logger.info(f"Received signal {signum}. Exiting gracefully...")
-        
-        # Stop the retraining scheduler thread
-        if self.retraining_thread and self.retraining_thread.is_alive():
-            logger.info("Stopping retraining scheduler...")
-            self.retraining_stop_event.set()
-            self.retraining_thread.join(timeout=5)
-        
-        # Send shutdown notification
-        try:
-            self.send_telegram_message("🛑 <b>Service Stopped</b>\nReceived termination signal.")
-        except:
-            pass
-            
+        logger.info("Received exit signal. Shutting down...")
+        self.running = False
         if self.ws:
-            self.ws.close()
+            try:
+                self.ws.close()
+            except:
+                pass
         sys.exit(0)
 
-    def send_telegram_message(self, message):
-        """Send a message via Telegram Bot API"""
-        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-            logger.warning("Telegram credentials not configured. Skipping notification.")
-            return False
+    # ------------------------------------------------------------------------
+    # TELEGRAM UTILS
+    # ------------------------------------------------------------------------
+    def on_trade_closed(self, message):
+        """Callback for when a trade closes - sends notification and cleans shadow ledger"""
+        # Send the trade notification message
+        self.send_telegram_message(message)
         
+        # Parse symbol from message and remove from shadow ledger
+        # Message format: "Symbol: BTCUSDT\n..."
+        try:
+            for line in message.split('\n'):
+                if line.startswith('Symbol:'):
+                    symbol = line.split(':')[1].strip().lower()
+                    if symbol in self.active_trades:
+                        del self.active_trades[symbol]
+                        logger.info(f"🗑️ Removed {symbol.upper()} from shadow ledger")
+                    break
+        except Exception as e:
+            logger.error(f"Error cleaning shadow ledger: {e}")
+
+    def send_telegram_message(self, message):
+        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+            return
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-            payload = {
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": message,
-                "parse_mode": "HTML"
-            }
-            response = requests.post(url, json=payload, timeout=10)
-            response.raise_for_status()
-            logger.info("Telegram message sent successfully.")
-            return True
+            requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}, timeout=5)
         except Exception as e:
-            logger.error(f"Failed to send Telegram message: {e}")
-            return False
+            logger.error(f"Telegram Error: {e}")
 
     def send_telegram_photo(self, photo_bytes, caption=""):
-        """Send a photo via Telegram Bot API"""
+        """Send a photo to Telegram"""
         if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-            logger.warning("Telegram credentials not configured. Skipping photo.")
-            return False
-        
+            return
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-            files = {
-                'photo': ('chart.png', photo_bytes, 'image/png')
-            }
-            data = {
-                'chat_id': TELEGRAM_CHAT_ID,
-                'caption': caption,
-                'parse_mode': 'HTML'
-            }
-            response = requests.post(url, files=files, data=data, timeout=30)
-            response.raise_for_status()
-            logger.info("Telegram photo sent successfully.")
-            return True
+            files = {'photo': ('chart.png', photo_bytes, 'image/png')}
+            data = {'chat_id': TELEGRAM_CHAT_ID, 'caption': caption, 'parse_mode': 'HTML'}
+            requests.post(url, files=files, data=data, timeout=10)
         except Exception as e:
-            logger.error(f"Failed to send Telegram photo: {e}")
-            return False
+            logger.error(f"Telegram Photo Error: {e}")
 
-    def generate_candle_chart(self, df_20min, symbol):
-        """Generate a candlestick chart from the last 20 minutes of data"""
-        try:
-            # Prepare data for mplfinance
-            # mplfinance expects DatetimeIndex and columns: Open, High, Low, Close, Volume
-            chart_df = df_20min[['start_ts', 'open', 'high', 'low', 'close', 'total_volume']].copy()
-            chart_df.columns = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']
-            chart_df.set_index('Date', inplace=True)
-            
-            # Create the chart
-            fig, axes = mpf.plot(
-                chart_df,
-                type='candle',
-                style='charles',
-                title=f'{symbol.upper()} Price Chart - Last {len(chart_df)} Candles (1m)',
-                ylabel='Price (USD)',
-                volume=True,
-                ylabel_lower='Volume',
-                figsize=(12, 8),
-                returnfig=True
-            )
-            
-            # Save to bytes buffer
-            buf = io.BytesIO()
-            fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
-            buf.seek(0)
-            plt.close(fig)
-            
-            return buf.getvalue()
-        except Exception as e:
-            logger.error(f"Error generating candle chart: {e}")
-            return None
-
-    def generate_latest_chart(self, symbol):
-        """Generate 1m candle chart for the last 60 minutes for a symbol"""
-        data_copy = []
+    def generate_chart_for_symbol(self, symbol):
+        """Generate a 1-minute candle chart for the last 1 hour with orderflow data"""
         with self.lock:
-            if symbol in self.latest_data:
-                data_copy = list(self.latest_data[symbol])
-        
-        if not data_copy:
-            return None
+            # Don't generate charts until buffers are populated with historical data
+            if not self.buffers_ready:
+                logger.warning(f"Buffers not ready yet - skipping chart generation for {symbol}")
+                return None
             
-        try:
-            df_all = pd.DataFrame(data_copy)
-            if 'symbol' in df_all.columns:
-                df_all = df_all[df_all['symbol'].str.lower() == symbol.lower()].copy()
+            if symbol not in self.latest_data or len(self.latest_data[symbol]) == 0:
+                return None
             
-            if 'start_ts' in df_all.columns:
-                df_all = self._parse_dates(df_all)
-                df_all.set_index('start_ts', inplace=True)
-                
-                df_1m = df_all.resample('1min').agg({
-                    'open': 'first',
-                    'high': 'max',
-                    'low': 'min',
-                    'close': 'last',
-                    'total_volume': 'sum'
-                }).dropna()
-                
-                if len(df_1m) >= 5:
-                    df_chart = df_1m.tail(60).copy()
-                    df_chart = df_chart.reset_index()
-                    return self.generate_candle_chart(df_chart, symbol)
-        except Exception as e:
-            logger.error(f"Error generating latest chart for {symbol}: {e}")
+            # Get last 60 candles (1 hour of 1-minute candles)
+            data = self.latest_data[symbol][-60:]
+            if len(data) < 10:  # Need at least some data
+                return None
             
-        return None
-
-    def send_status_message(self, title, alerts=None):
-        """Send a status message with optional alerts highlighted"""
-        if alerts is None:
-            alerts = []
+            df = pd.DataFrame(data)
             
-        # Send title as separate message
-        self.send_telegram_message(f"<b>{title}</b>")
-        
-        # Iterate over ALL symbols to build the message
-        for sym in self.symbols:
-            pred_data = self.last_prediction_data.get(sym)
-            if pred_data:
-                sym_msg = ""
-                # Get emoji for prediction direction
-                direction_emoji = ""
-                if pred_data['direction'] == "PUMP":
-                    direction_emoji = "🚀"
-                elif pred_data['direction'] == "DUMP":
-                    direction_emoji = "📉"
-                elif pred_data['direction'] == "NEUTRAL":
-                    direction_emoji = "➖"
-                
-                # Check if this symbol has an alert
-                crossed = [cat for s, cat in alerts if s == sym]
-                
-                # Add header with alert indicator
-                if crossed:
-                    sym_msg += f"⚠️ <b><u>{sym.upper()}</u> (ALERT: {', '.join(crossed)})</b>\n"
+            # Ensure required columns exist
+            required_cols = ['close', 'open', 'high', 'low']
+            if not all(col in df.columns for col in required_cols):
+                return None
+            
+            # Convert to numeric
+            for col in required_cols:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+            # Also convert orderflow columns if available
+            orderflow_cols = ['total_volume', 'taker_buy_volume', 'buy_volume', 'sell_volume']
+            has_orderflow = False
+            for col in orderflow_cols:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+                    has_orderflow = True
+            
+            # Drop any rows with NaN values in price columns
+            df = df.dropna(subset=required_cols)
+            if len(df) == 0:
+                return None
+            
+            # Calculate buy/sell volume from orderflow data
+            if has_orderflow:
+                # If we have taker_buy_volume, use it; otherwise try buy_volume/sell_volume
+                if 'taker_buy_volume' in df.columns and 'total_volume' in df.columns:
+                    df['buy_vol'] = df['taker_buy_volume'].fillna(0)
+                    df['sell_vol'] = df['total_volume'].fillna(0) - df['buy_vol']
+                elif 'buy_volume' in df.columns and 'sell_volume' in df.columns:
+                    df['buy_vol'] = df['buy_volume'].fillna(0)
+                    df['sell_vol'] = df['sell_volume'].fillna(0)
                 else:
-                    sym_msg += f"<b><u>{sym.upper()}</u></b>\n"
-
-                sym_msg += f"Price: <code>${pred_data['price']:.2f}</code>\n"
-                sym_msg += f"OFI: <code>{pred_data['delta']:.2f}</code>\n"
-                sym_msg += f"<b>LGBM:</b> {direction_emoji} <b>{pred_data['direction']}</b> ({pred_data['confidence']:.2%})\n"
-                sym_msg += f"• NEUTRAL: <code>{pred_data['probs']['NEUTRAL']:.2%}</code>\n"
-                sym_msg += f"• PUMP: <code>{pred_data['probs']['PUMP']:.2%}</code>\n"
-                sym_msg += f"• DUMP: <code>{pred_data['probs']['DUMP']:.2%}</code>\n"
-
-                if pred_data.get('lstm_direction') and pred_data['lstm_direction'] != "N/A":
-                    l_emoji = ""
-                    if pred_data['lstm_direction'] == "PUMP":
-                        l_emoji = "🚀"
-                    elif pred_data['lstm_direction'] == "DUMP":
-                        l_emoji = "📉"
-                    elif pred_data['lstm_direction'] == "NEUTRAL":
-                        l_emoji = "➖"
-                    sym_msg += f"\n<b>LSTM:</b> {l_emoji} <b>{pred_data['lstm_direction']}</b> ({pred_data['lstm_confidence']:.2%})\n"
-
-                    # Add LSTM probabilities if available
-                    if 'lstm_probs' in pred_data:
-                        lp = pred_data['lstm_probs']
-                        sym_msg += f"• NEUTRAL: <code>{lp['NEUTRAL']:.2%}</code>\n"
-                        sym_msg += f"• PUMP: <code>{lp['PUMP']:.2%}</code>\n"
-                        sym_msg += f"• DUMP: <code>{lp['DUMP']:.2%}</code>\n"
+                    df['buy_vol'] = 0
+                    df['sell_vol'] = 0
                 
-                # Generate chart for THIS symbol
-                chart_bytes = self.generate_latest_chart(sym)
-                
-                if chart_bytes:
-                    self.send_telegram_photo(chart_bytes, sym_msg)
-                else:
-                    self.send_telegram_message(sym_msg)
-
-    def send_batched_alerts(self):
-        """Send a single aggregated message for all pending threshold crossing alerts"""
-        alerts_to_send = []
-        with self.lock:
-            if not self.pending_alerts:
-                return
-            
-            # Copy and clear pending alerts
-            alerts_to_send = list(self.pending_alerts)
-            self.pending_alerts = []
-            self.alert_batch_timer = None
-        
-        self.send_status_message("🚨 <b>ALERT: Threshold Crossed!</b>", alerts_to_send)
-    
-    def send_followup(self, symbol, category, trigger_price, trigger_time, label):
-        """Send follow-up notification with chart"""
-        try:
-            # 1. Get Data (Locked)
-            with self.lock:
-                if symbol not in self.latest_data or not self.latest_data[symbol]:
-                    return
-                # Copy data to avoid holding lock during processing
-                data_copy = list(self.latest_data[symbol])
-            
-            # 2. Process Data (Unlocked)
-            df_all = pd.DataFrame(data_copy)
-            if 'start_ts' not in df_all.columns:
-                return
-            
-            # Filter to ensure only this symbol's data (in case of mixed data)
-            if 'symbol' in df_all.columns:
-                df_all = df_all[df_all['symbol'].str.lower() == symbol.lower()].copy()
-            
-            # Handle mixed types
-            df_all = self._parse_dates(df_all)
-            df_all.set_index('start_ts', inplace=True)
-            
-            # Resample to 1m
-            df_1m = df_all.resample('1min').agg({
-                'open': 'first',
-                'high': 'max',
-                'low': 'min',
-                'close': 'last',
-                'total_volume': 'sum'
-            }).dropna()
-            
-            if df_1m.empty:
-                return
-
-            current_price = df_1m.iloc[-1]['close']
-            
-            # Determine chart window
-            # Start from trigger_time - offset (60 mins before trigger to match initial chart)
-            offset = timedelta(minutes=60)
-            start_chart = trigger_time - offset
-            
-            # Filter data
-            df_chart = df_1m[df_1m.index >= start_chart].copy()
-            
-            # Generate chart
-            chart_bytes = None
-            if len(df_chart) >= 5:
-                # Reset index for plotting function
-                df_chart_reset = df_chart.reset_index()
-                # Rename columns to match what generate_candle_chart expects if needed
-                # But generate_candle_chart expects 'start_ts' which we have after reset_index
-                
-                logger.info(f"Generating {label} follow-up chart for {category}...")
-                chart_bytes = self.generate_candle_chart(df_chart_reset, symbol)
-            
-            # Calculate stats
-            pct_change = (current_price - trigger_price) / trigger_price
-            
-            emoji = "➖"
-            if category == "PUMP":
-                emoji = "✅" if pct_change > 0 else "❌"
-            elif category == "DUMP":
-                emoji = "✅" if pct_change < 0 else "❌"
-            
-            # Get emoji for category
-            category_emoji = "🚀" if category == "PUMP" else "📉" if category == "DUMP" else "➖"
-            message = f"⏱️ <b>{label} Follow-up: {category_emoji} {category} ({symbol.upper()})</b>\n\n"
-            message += f"Trigger Price: ${trigger_price:.2f}\n"
-            message += f"Current Price: ${current_price:.2f}\n"
-            message += f"Change: {pct_change:.2%} {emoji}\n"
-            
-            if chart_bytes:
-                self.send_telegram_photo(chart_bytes, message)
-            else:
-                self.send_telegram_message(message)
-                
-        except Exception as e:
-            logger.error(f"Error in follow-up for {symbol}: {e}")
-        finally:
-            # Reset flag if 2h
-            if label == "2h":
-                with self.lock:
-                    self.active_events[symbol][category] = False
-                    logger.info(f"Reset active event for {category} on {symbol}")
-
-    def check_and_send_notifications(self, symbol, timestamp, price, delta, direction, confidence, probs):
-        """Check if notifications should be sent based on threshold crossing or hourly schedule"""
-        current_time = datetime.now()
-        
-        # Note: Prediction data is now stored in on_message method before calling this function
-        
-        current_probs = {
-            'NEUTRAL': probs[0],
-            'PUMP': probs[1],
-            'DUMP': probs[2]
-        }
-        
-        # Track which symbols crossed thresholds in this call
-        symbols_with_alerts = []
-        
-        # Check for triggers using new logic
-        # Convert probs to percentage for threshold check
-        prob_pump_pct = probs[1] * 100
-        prob_dump_pct = probs[2] * 100
-        
-        trigger = self.check_for_trigger(symbol, prob_pump_pct, prob_dump_pct, delta)
-        
-        category = None
-        if trigger == "LONG_ENTRY":
-            category = "PUMP"
-        elif trigger == "SHORT_ENTRY":
-            category = "DUMP"
-            
-        if category:
-            # Check if event is already active
-            if self.active_events[symbol][category]:
-                logger.info(f"Skipping {category} alert for {symbol} - Timer already running.")
-            else:
-                # Set active
-                self.active_events[symbol][category] = True
-                
-                # Schedule timers
-                # 30 min timer
-                t30 = threading.Timer(30 * 60, self.send_followup, args=[symbol, category, price, timestamp, "30min"])
-                t30.start()
-                
-                # 2 hour timer
-                t120 = threading.Timer(2 * 60 * 60, self.send_followup, args=[symbol, category, price, timestamp, "2h"])
-                t120.start()
-                
-                # Track this alert
-                symbols_with_alerts.append((symbol, category))
-        
-        # Batch alerts instead of sending immediately
-        if symbols_with_alerts:
-            with self.lock:
-                # Add alerts to pending list
-                self.pending_alerts.extend(symbols_with_alerts)
-                
-                # Cancel existing timer if any
-                if self.alert_batch_timer is not None:
-                    self.alert_batch_timer.cancel()
-                
-                # Start new timer to send batched alerts after delay
-                self.alert_batch_timer = threading.Timer(self.alert_batch_delay, self.send_batched_alerts)
-                self.alert_batch_timer.start()
-        
-        # Update previous probabilities for this symbol
-        self.previous_probs[symbol] = current_probs.copy()
-        
-        # Check for hourly update
-        if self.last_hourly_message_time is None:
-            self.last_hourly_message_time = current_time
-        
-        time_since_last_hourly = (current_time - self.last_hourly_message_time).total_seconds()
-        if time_since_last_hourly >= 3600 and self.send_hourly_message:  # 3600 seconds = 1 hour
-            self.send_status_message("📊 <b>Hourly Update - All Symbols</b>")
-            self.last_hourly_message_time = current_time
-        
-        # Check for nightly chart generation (once per day at night)
-        # Trigger if: 
-        # 1. Never sent before (last_nightly_chart_time is None), OR
-        # 2. More than 24 hours have passed since last nightly chart
-        # 3. Current time is between midnight and 1 AM (0:00 - 1:00)
-        if self.last_nightly_chart_time is None:
-            # First time - check if it's nighttime (between 0:00 and 1:00)
-            if 0 <= current_time.hour < 1:
-                logger.info("First nightly chart - triggering generation...")
-                threading.Thread(target=self.generate_nightly_charts).start()
-        else:
-            time_since_last_nightly = (current_time - self.last_nightly_chart_time).total_seconds()
-            # If more than 24 hours and it's nighttime (0:00 - 1:00)
-            if time_since_last_nightly >= 86400 and 0 <= current_time.hour < 1:
-                logger.info("24 hours passed and it's nighttime - triggering nightly chart generation...")
-                threading.Thread(target=self.generate_nightly_charts).start()
-
-    def generate_nightly_charts(self):
-        """Generate and send 1-hour timeframe charts for all symbols covering the last 24 hours"""
-        try:
-            logger.info("Generating nightly charts for all symbols...")
-            
-            for symbol in self.symbols:
-                with self.lock:
-                    if symbol not in self.latest_data or not self.latest_data[symbol]:
-                        logger.warning(f"No data available for {symbol} to generate nightly chart.")
-                        continue
-                    # Copy data to avoid holding lock during processing
-                    data_copy = list(self.latest_data[symbol])
-                
-                # Process data (unlocked)
-                df_all = pd.DataFrame(data_copy)
-                if 'start_ts' not in df_all.columns:
-                    logger.warning(f"Missing start_ts column for {symbol}.")
-                    continue
-                
-                # Filter to ensure only this symbol's data
-                if 'symbol' in df_all.columns:
-                    df_all = df_all[df_all['symbol'].str.lower() == symbol.lower()].copy()
-                
-                # Handle mixed types (strings from WS, datetimes from history)
-                df_all = self._parse_dates(df_all)
-                df_all.set_index('start_ts', inplace=True)
-                
-                # Resample to 1-hour candles
-                df_1h = df_all.resample('1h').agg({
-                    'open': 'first',
-                    'high': 'max',
-                    'low': 'min',
-                    'close': 'last',
-                    'total_volume': 'sum'
-                }).dropna()
-                
-                if df_1h.empty:
-                    logger.warning(f"No 1h candle data available for {symbol}.")
-                    continue
-                
-                # Get last 24 hours of data (24 candles)
-                df_chart = df_1h.tail(24).copy()
-                
-                if len(df_chart) < 5:
-                    logger.warning(f"Not enough 1h candles for {symbol}. Have {len(df_chart)}, need at least 5.")
-                    continue
-                
-                # Reset index for chart generation
-                df_chart_reset = df_chart.reset_index()
-                
-                # Generate chart with modified title for 1h timeframe
-                logger.info(f"Generating nightly 1h chart for {symbol} with {len(df_chart)} candles...")
-                
-                # Prepare data for mplfinance
-                chart_df = df_chart_reset[['start_ts', 'open', 'high', 'low', 'close', 'total_volume']].copy()
-                chart_df.columns = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']
-                chart_df.set_index('Date', inplace=True)
-                
-                # Create the chart with 1h title
-                try:
-                    fig, axes = mpf.plot(
-                        chart_df,
-                        type='candle',
-                        style='charles',
-                        title=f'{symbol.upper()} Price Chart - Last 24 Hours (1h candles)',
-                        ylabel='Price (USD)',
-                        volume=True,
-                        ylabel_lower='Volume',
-                        figsize=(12, 8),
-                        returnfig=True
-                    )
-                    
-                    # Save to bytes buffer
-                    buf = io.BytesIO()
-                    fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
-                    buf.seek(0)
-                    plt.close(fig)
-                    
-                    chart_bytes = buf.getvalue()
-                    
-                    if chart_bytes:
-                        caption = f"🌙 <b>Nightly Chart: {symbol.upper()}</b>\n📊 1-hour timeframe - Last 24 hours ({len(df_chart)} candles)"
-                        self.send_telegram_photo(chart_bytes, caption)
-                        logger.info(f"Nightly chart sent for {symbol}.")
-                    
-                except Exception as e:
-                    logger.error(f"Error generating nightly chart for {symbol}: {e}")
-                    
-            # Update last nightly chart time
-            self.last_nightly_chart_time = datetime.now()
-            logger.info("Nightly chart generation completed.")
-            
-        except Exception as e:
-            logger.error(f"Error in generate_nightly_charts: {e}")
-
-    def _parse_dates(self, df):
-        """Helper to parse dates robustly for old pandas (compatible with pandas<1.3.0)"""
-        if 'start_ts' in df.columns:
-            # Handle mixed timestamp formats (ISO format with Z, space-separated with timezone offset, etc.)
-            # Skip conversion if already datetime
-            if df['start_ts'].dtype == object:
-                # Three-step normalization for consistent parsing:
-                # 1. Replace 'Z' suffix with '+00:00' (normalize timezone suffix)
-                df['start_ts'] = df['start_ts'].astype(str).str.replace('Z', '+00:00', regex=False)
-                # 2. Replace 'T' with space (normalize date-time separator)
-                df['start_ts'] = df['start_ts'].astype(str).str.replace('T', ' ', regex=False)
-                # 3. Add '.000000' to timestamps without fractional seconds
-                df['start_ts'] = df['start_ts'].astype(str).str.replace(
-                    r'(\d{2}:\d{2}:\d{2})(\+)',
-                    r'\1.000000\2',
-                    regex=True
+                # Calculate buy pressure ratio for candle coloring
+                df['total_vol'] = df['buy_vol'] + df['sell_vol']
+                df['buy_pressure'] = df.apply(
+                    lambda row: row['buy_vol'] / row['total_vol'] if row['total_vol'] > 0 else 0.5,
+                    axis=1
                 )
-                # Parse timestamps
+            
+            # Create chart with 2 subplots: price and volume
+            if has_orderflow:
+                fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), 
+                                              gridspec_kw={'height_ratios': [3, 1]})
+            else:
+                fig, ax1 = plt.subplots(figsize=(12, 6))
+            
+            # Plot candlesticks with orderflow-based coloring
+            for idx, row in df.iterrows():
+                if has_orderflow and 'buy_pressure' in row:
+                    # Color based on buy pressure
+                    # Strong buying pressure (>60%) = bright green
+                    # Strong selling pressure (<40%) = bright red
+                    # Neutral (40-60%) = gray/yellow
+                    if row['buy_pressure'] > 0.6:
+                        color = '#00ff00' if row['close'] >= row['open'] else '#90ee90'
+                    elif row['buy_pressure'] < 0.4:
+                        color = '#ff0000' if row['close'] < row['open'] else '#ff6b6b'
+                    else:
+                        color = '#ffa500' if row['close'] >= row['open'] else '#ffcc00'
+                else:
+                    # Fallback to simple coloring
+                    color = 'green' if row['close'] >= row['open'] else 'red'
+                
+                # Draw high-low line
+                ax1.plot([idx, idx], [row['low'], row['high']], color=color, linewidth=1)
+                # Draw open-close box
+                height = abs(row['close'] - row['open'])
+                bottom = min(row['open'], row['close'])
+                ax1.add_patch(plt.Rectangle((idx - 0.4, bottom), 0.8, height, 
+                                          facecolor=color, edgecolor=color, alpha=0.8))
+            
+            ax1.set_ylabel('Price (USD)', fontsize=10)
+            ax1.set_title(f'{symbol.upper()} - Last Hour (1-minute candles with Orderflow)', 
+                         fontsize=12, fontweight='bold')
+            ax1.grid(True, alpha=0.3)
+            
+            # Plot orderflow volume if available
+            if has_orderflow:
+                # Plot buy and sell volume as stacked bars
+                indices = df.index.tolist()
+                buy_vols = df['buy_vol'].tolist()
+                sell_vols = df['sell_vol'].tolist()
+                
+                ax2.bar(indices, buy_vols, width=0.8, color='green', alpha=0.7, label='Buy Volume')
+                ax2.bar(indices, sell_vols, width=0.8, color='red', alpha=0.7, 
+                       bottom=buy_vols, label='Sell Volume')
+                
+                ax2.set_xlabel('Candle Index (1min each)', fontsize=10)
+                ax2.set_ylabel('Volume', fontsize=10)
+                ax2.legend(loc='upper left', fontsize=8)
+                ax2.grid(True, alpha=0.3)
+            else:
+                ax1.set_xlabel('Candle Index (1min each)', fontsize=10)
+            
+            # Save to bytes
+            buf = io.BytesIO()
+            plt.tight_layout()
+            plt.savefig(buf, format='png', dpi=100)
+            buf.seek(0)
+            # Close all figures to prevent accumulation of markers/plots
+            plt.close('all')
+            
+            return buf.read()
+
+    # ------------------------------------------------------------------------
+    # HISTORICAL DATA FETCHING (From Old Code - Vital for Cold Start)
+    # ------------------------------------------------------------------------
+    def _parse_dates(self, df):
+        """Helper to parse dates robustly"""
+        if 'start_ts' in df.columns:
+            if df['start_ts'].dtype == object:
+                # Normalize timestamp format
+                df['start_ts'] = df['start_ts'].astype(str).str.replace('Z', '+00:00', regex=False)
+                df['start_ts'] = df['start_ts'].astype(str).str.replace('T', ' ', regex=False)
                 df['start_ts'] = pd.to_datetime(df['start_ts'], errors='coerce')
-                # Ensure UTC timezone
+
                 if df['start_ts'].dt.tz is None:
                     df['start_ts'] = df['start_ts'].dt.tz_localize('UTC')
                 else:
-                    df['start_ts'] = df['start_ts'].dt.tz_convert('UTC')
-            elif not pd.api.types.is_datetime64_any_dtype(df['start_ts']):
-                # Handle other non-datetime types
-                df['start_ts'] = pd.to_datetime(df['start_ts'], errors='coerce')
-                if df['start_ts'].dt.tz is None:
-                    df['start_ts'] = df['start_ts'].dt.tz_localize('UTC')
-            else:
-                # Already datetime, ensure timezone-aware
-                if df['start_ts'].dt.tz is None:
-                    df['start_ts'] = df['start_ts'].dt.tz_localize('UTC')
-                elif str(df['start_ts'].dt.tz) != 'UTC':
                     df['start_ts'] = df['start_ts'].dt.tz_convert('UTC')
         return df
 
-    def fetch_historical_data(self, symbols, days=7, fetch_golden=True, golden_days=365):
-        logger.info(f"Fetching data for symbols {symbols}...")
-        all_data = []
-        seen_keys = set() # (symbol, start_ts)
-        
+    def fetch_historical_data(self, days=2):
+        """Fetches recent history to pre-fill buffers so model works immediately"""
+        logger.info(f"Fetching last {days} days of data to warm up buffers...")
+
         headers = {}
         if AUTH_TOKEN:
             headers["Authorization"] = f"Bearer {AUTH_TOKEN}"
         headers["Accept-Encoding"] = "gzip, deflate"
 
-        # Helper to process response line items
-        def process_response(response, source_desc=""):
-            count = 0
-            for line in response.iter_lines():
+        end_time = datetime.now(timezone.utc)
+        start_time = end_time - timedelta(days=days)
+
+        all_data = []
+
+        params = {
+            'start': start_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            'end': end_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            'symbols': ','.join(self.symbols)
+        }
+
+        try:
+            r = requests.get(f"{BASE_URL}/download/trade_groups", params=params, headers=headers, stream=True)
+            r.raise_for_status()
+
+            for line in r.iter_lines():
                 if line:
                     try:
                         item = json.loads(line.decode('utf-8'))
-                        # Create unique key
-                        sym = item.get('symbol')
-                        ts = item.get('start_ts')
-                        if sym and ts:
-                            # Normalize symbol to ensure uniqueness match
-                            # Trade groups usually return lowercase symbol
-                            key = (str(sym).lower(), ts)
-                            if key not in seen_keys:
-                                seen_keys.add(key)
-                                all_data.append(item)
-                                count += 1
-                    except json.JSONDecodeError:
+                        all_data.append(item)
+                    except:
                         continue
-            logger.info(f"Fetched {count} new unique records from {source_desc}")
-
-        # 1. Fetch Golden Dataset
-        if fetch_golden:
-            logger.info(f"Fetching Golden Dataset events (last {golden_days} days)...")
-            try:
-                golden_endpoint = f"{BASE_URL}/golden_dataset"
-                # Define window for golden dataset (configurable via golden_days parameter)
-                golden_end_time = datetime.now(timezone.utc)
-                golden_start_time = golden_end_time - timedelta(days=golden_days)
-                
-                g_start_str = golden_start_time.strftime("%Y-%m-%dT%H:%M:%SZ")
-                g_end_str = golden_end_time.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-                for symbol in symbols:
-                    # Get events with date filter
-                    params = {
-                        'symbol': symbol,
-                        'start_time': g_start_str,
-                        'end_time': g_end_str
-                    }
-                    resp = requests.get(golden_endpoint, params=params, headers=headers)
-                    if resp.status_code == 200:
-                        events = resp.json()
-                        logger.info(f"Found {len(events)} golden events for {symbol}")
-                        
-                        for i, event in enumerate(events):
-                            start_str = event.get('start_time')
-                            end_str = event.get('end_time')
-                            
-                            if start_str and end_str:
-                                try:
-                                    # Convert to datetime to handle formatting
-                                    s_dt = pd.to_datetime(start_str).astimezone(timezone.utc)
-                                    e_dt = pd.to_datetime(end_str).astimezone(timezone.utc)
-                                    
-                                    # Fetch trade groups for this event
-                                    params = {
-                                        'start': s_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                                        'end': e_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                                        'symbols': symbol
-                                    }
-                                    
-                                    r = requests.get(f"{BASE_URL}/download/trade_groups", params=params, headers=headers, stream=True)
-                                    r.raise_for_status()
-                                    process_response(r, f"Golden Event {i+1} ({event.get('reason', 'Unknown')}) for {symbol}")
-                                except Exception as e:
-                                    logger.error(f"Error fetching data for golden event {i}: {e}")
-                    elif resp.status_code == 404:
-                        logger.info(f"No golden dataset found for {symbol}")
-                    else:
-                        logger.warning(f"Failed to fetch golden events for {symbol}: {resp.status_code}")
-            except Exception as e:
-                logger.error(f"Error in golden dataset fetch phase: {e}")
-        else:
-            logger.info("Skipping Golden Dataset fetch (Models are up to date).")
-
-        # 2. Fetch Last N Days (Training Data)
-        logger.info(f"Fetching last {days} days of training data...")
-        end_time = datetime.now(timezone.utc)
-        start_time_days = end_time - timedelta(days=days)
-        
-        # Split into 3 chunks
-        total_duration = end_time - start_time_days
-        chunk_duration = total_duration / 3
-        
-        for i in range(3):
-            chunk_end = end_time - (chunk_duration * i)
-            chunk_start = chunk_end - chunk_duration
-            
-            params = {
-                'start': chunk_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                'end': chunk_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                'symbols': ','.join(symbols)
-            }
-            
-            try:
-                logger.info(f"Request {i+1}/3: Downloading from {params['start']} to {params['end']}...")
-                r = requests.get(f"{BASE_URL}/download/trade_groups", params=params, headers=headers, stream=True)
-                r.raise_for_status()
-                process_response(r, f"Training Data Chunk {i+1}")
-            except Exception as e:
-                logger.error(f"Error fetching chunk {i+1}: {e}")
+        except Exception as e:
+            logger.error(f"Error fetching historical data: {e}")
+            return pd.DataFrame()
 
         df = pd.DataFrame(all_data)
         if not df.empty:
             df = self._parse_dates(df)
             df = df.sort_values('start_ts').reset_index(drop=True)
-            logger.info(f"Total compiled records: {len(df)}")
-        else:
-            logger.warning("No data fetched.")
-            
+            logger.info(f"Fetched {len(df)} historical records.")
         return df
 
-    def calculate_rsi(self, series, period=14):
+    # ------------------------------------------------------------------------
+    # AUTO-RETRAINING: LABELING LOGIC (The "Teacher")
+    # ------------------------------------------------------------------------
+    def apply_triple_barrier_labels(self, df):
+        """
+        Generates 'meta_label' (1=Win, 0=Loss) for fresh historical data.
+        Uses the Trailing Stop logic we defined earlier.
+        """
+        logger.info("Applying Triple Barrier Labels to fresh data...")
+        df = df.copy()
+        labels = []
+
+        # Parameters (Match your strategy)
+        initial_stop_loss_pct = 0.01  # 1%
+        trailing_pct = 0.015  # 1.5% Trailing
+        min_profit_pct = 0.015  # Minimum 1.5% profit to be a "Win"
+
+        # We need future data to label the past
+        # Iterate until the end minus a buffer (e.g., last 100 rows can't be labeled yet)
+        lookahead_buffer = 500
+
+        for i in range(len(df) - lookahead_buffer):
+            entry_price = df['close'].iloc[i]
+
+            # --- LOGIC: SIMULATE A LONG TRADE ---
+            highest_price = entry_price
+            stop_price = entry_price * (1 - initial_stop_loss_pct)
+            outcome = 0  # Default: Loss/Neutral
+
+            # Look forward up to 500 bars (e.g. ~5-10 hours depending on volume)
+            for j in range(1, 500):
+                current_price = df['close'].iloc[i + j]
+
+                # 1. Check Trailing Stop Update
+                if current_price > highest_price:
+                    highest_price = current_price
+                    new_stop = highest_price * (1 - trailing_pct)
+                    if new_stop > stop_price:
+                        stop_price = new_stop
+
+                # 2. Check Exit (Hit Stop)
+                if current_price < stop_price:
+                    # Trade ended. Calculate PnL.
+                    pnl = (stop_price - entry_price) / entry_price
+
+                    if pnl > min_profit_pct:
+                        outcome = 1  # WIN
+                    break  # Exit simulation loop
+
+            labels.append(outcome)
+
+        # Fill the remaining buffer with 0 (cannot label yet)
+        labels.extend([0] * lookahead_buffer)
+
+        df['meta_label'] = labels
+
+        # Only keep rows that actually had a Primary Signal (Z-Score Trigger)
+        # Because we only want to train the Meta-Model on situations where it gets asked!
+        # Re-calculate Z-Score if not present, but it should be there from feature eng.
+        df['primary_signal'] = 0
+        df.loc[df['flow_z_score'] > 1.5, 'primary_signal'] = 1  # Long triggers
+        df.loc[
+            df['flow_z_score'] < -1.5, 'primary_signal'] = 1  # Short triggers (mapped to same label logic for now)
+
+        return df
+
+    # ------------------------------------------------------------------------
+    # FEATURE ENGINEERING
+    # ------------------------------------------------------------------------
+    def _calculate_rsi(self, series, period=14):
         delta = series.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        gain = (delta.where(delta > 0, 0)).ewm(span=period, adjust=False).mean()
+        loss = (-delta.where(delta < 0, 0)).ewm(span=period, adjust=False).mean()
         rs = gain / loss
         return 100 - (100 / (1 + rs))
 
-    def prepare_features(self, df):
-        if df.empty:
-            return df
-            
+    def add_market_features(self, df):
+        """Adds all features required by the Meta-Model"""
         df = df.copy()
-        
-        # Basic features
-        df['return'] = df['close'].pct_change()
-        df['volatility'] = df['return'].rolling(window=20).std()
-        df['rsi'] = self.calculate_rsi(df['close'])
-        
-        # Ensure start_ts is datetime for time-based rolling
-        df = self._parse_dates(df)
-        if 'start_ts' in df.columns:
-            
-            # Set index to start_ts for time-based rolling, but keep it as column
-            # We sort just in case, though data should be sorted
-            df = df.sort_values('start_ts')
-            temp_index = pd.DatetimeIndex(df['start_ts'])
-            
-            # A. Rolling Sum (Accumulation)
-            # Sum of OFI (delta) over last N seconds
-            # We use the temp_index for rolling
-            df['ofi_sum_10s'] = df.set_index(temp_index)['delta'].rolling('10s').sum().values
-            df['ofi_sum_60s'] = df.set_index(temp_index)['delta'].rolling('60s').sum().values
-            df['ofi_sum_300s'] = df.set_index(temp_index)['delta'].rolling('300s').sum().values
-            
-            # B. Lag Features (The "Shape" of the move)
-            # Previous values of OFI
-            df['ofi_lag_1'] = df['delta'].shift(1)
-            df['ofi_lag_2'] = df['delta'].shift(2)
-            df['ofi_lag_3'] = df['delta'].shift(3)
-            df['ofi_lag_5'] = df['delta'].shift(5)
+
+        # 1. Delta
+        if 'taker_buy_volume' in df.columns and 'total_volume' in df.columns:
+            df['delta'] = 2 * df['taker_buy_volume'] - df['total_volume']
         else:
-            # Fallback if no start_ts (should not happen in main flow)
-            for col in ['ofi_sum_10s', 'ofi_sum_60s', 'ofi_sum_300s', 'ofi_lag_1', 'ofi_lag_2', 'ofi_lag_3', 'ofi_lag_5']:
-                df[col] = 0
+            direction_proxy = np.where(df['close'] > df['open'], 1, np.where(df['close'] < df['open'], -1, 0))
+            df['delta'] = df['total_volume'] * direction_proxy
+
+        # 2. Flow Momentum & Z-Score
+        df['flow_momentum'] = df['delta'].ewm(span=5, adjust=False).mean()
+        rolling_window = 100
+        df['flow_std'] = df['flow_momentum'].rolling(window=rolling_window).std().replace(0, 0.0001)
+        df['flow_mean'] = df['flow_momentum'].rolling(window=rolling_window).mean()
+        df['flow_z_score'] = (df['flow_momentum'] - df['flow_mean']) / df['flow_std']
+
+        # 3. Basic Market Features
+        df['returns'] = df['close'].pct_change()
+        df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
+        df['volatility_20'] = df['log_ret'].rolling(window=20).std()
+
+        if 'delta' in df.columns:
+            df['delta_ma_10'] = df['delta'].rolling(window=10).mean()
+            df['cum_delta'] = df['delta'].cumsum()
+        else:
+            df['delta_ma_10'] = 0
+            df['cum_delta'] = 0
+
+        df['volume_ma_20'] = df['total_volume'].rolling(window=20).mean()
+        df['volume_ratio'] = df['total_volume'] / df['volume_ma_20']
+
+        # 4. Momentum
+        df['momentum_5'] = df['close'].pct_change(5)
+        df['momentum_10'] = df['close'].pct_change(10)
+        df['momentum_20'] = df['close'].pct_change(20)
+
+        # 5. MA Relations
+        df['ma_20'] = df['close'].rolling(window=20).mean()
+        df['ma_50'] = df['close'].rolling(window=50).mean()
+        df['price_to_ma20'] = df['close'] / df['ma_20'] - 1
+        df['price_to_ma50'] = df['close'] / df['ma_50'] - 1
+        df['ma_20_50_diff'] = (df['ma_20'] / df['ma_50'] - 1)
+
+        df['rsi'] = self._calculate_rsi(df['close'], 14)
+
+        # 6. Duration Features
+        if 'bar_duration_ms' in df.columns:
+            df['log_duration'] = np.log1p(df['bar_duration_ms'])
+
+            duration_seconds = df['bar_duration_ms'] / 1000.0
+            duration_seconds = duration_seconds.replace(0, 0.001)
+            if 'trade_count' in df.columns:
+                df['trades_per_second'] = df['trade_count'] / duration_seconds
+            else:
+                df['trades_per_second'] = 0
+
+            df['duration_mean'] = df['bar_duration_ms'].rolling(window=50).mean()
+            df['duration_std'] = df['bar_duration_ms'].rolling(window=50).std().replace(0, 1)
+            df['duration_z_score'] = (df['bar_duration_ms'] - df['duration_mean']) / df['duration_std']
+        else:
+            df['log_duration'] = 0
+            df['trades_per_second'] = 0
+            df['duration_z_score'] = 0
+
+        # 7. Delta Features
+        if 'delta' in df.columns and 'total_volume' in df.columns:
+            total_vol_safe = df['total_volume'].replace(0, 0.0001)
+            df['delta_ratio'] = (df['delta'] / total_vol_safe).clip(-1, 1)
+            df['delta_pct'] = (df['delta'] / total_vol_safe) * 100
+        else:
+            df['delta_ratio'] = 0
+            df['delta_pct'] = 0
+
+        # Min/Max Delta
+        if 'delta' in df.columns:
+            df['rolling_max_delta'] = df['delta'].rolling(window=10).max()
+            df['rolling_min_delta'] = df['delta'].rolling(window=10).min()
+            df['min_max_delta_ratio'] = df['rolling_max_delta'] / df['rolling_min_delta'].replace(0, 0.0001).abs()
+        else:
+            df['min_max_delta_ratio'] = 0
+
+        # Divergence
+        if 'cum_delta' in df.columns:
+            price_change = df['close'].diff(10)
+            cvd_change = df['cum_delta'].diff(10)
+            df['cumulative_delta_divergence'] = np.where(
+                (price_change > 0) & (cvd_change < 0), 1,
+                np.where((price_change < 0) & (cvd_change > 0), -1, 0)
+            )
+            df['cvd_momentum'] = df['cum_delta'].diff(5)
+        else:
+            df['cumulative_delta_divergence'] = 0
+            df['cvd_momentum'] = 0
+
+        # Consecutive Delta
+        if 'delta' in df.columns:
+            delta_sign = np.sign(df['delta'])
+            df['consecutive_delta'] = (delta_sign.groupby(
+                (delta_sign != delta_sign.shift()).cumsum()).cumcount() + 1) * delta_sign
+        else:
+            df['consecutive_delta'] = 0
+
+        # 8. Trade Structure
+        total_vol_safe = df['total_volume'].replace(0, 0.0001)
+
+        if 'largest_trade_qty' in df.columns:
+            df['whale_dominance'] = (df['largest_trade_qty'] / total_vol_safe) * 100
+        else:
+            df['whale_dominance'] = 0
+
+        if 'large_trade_dominance' in df.columns:
+            df['large_trade_ratio'] = df['large_trade_dominance'] / 100.0
+        else:
+            df['large_trade_ratio'] = 0
+
+        if 'high' in df.columns and 'low' in df.columns:
+            price_range = df['high'] - df['low']
+            df['efficiency_ratio'] = price_range / total_vol_safe
+            df['close_location'] = (df['close'] - df['low']) / price_range.replace(0, 0.0001)
+        else:
+            df['efficiency_ratio'] = 0
+            df['close_location'] = 0.5
 
         # Fill NaNs
         df = df.fillna(0)
-        
-        # Target: Max price change in next 20 bars
-        # We want to predict if price will go UP or DOWN significantly
-        # Let's define "significant" as > 0.1% move
-        
-        future_window = 20
-        
-        # Calculate future return (close-to-close)
-        df['future_close'] = df['close'].shift(-future_window)
-        df['future_return'] = (df['future_close'] - df['close']) / df['close']
-        
-        # Dynamic Threshold: 1 Standard Deviation of future returns
-        # This automatically adapts to the specific asset's volatility (e.g. SOL vs BTC)
-        # We ensure a minimum floor of 0.1% (0.001) to ignore minimal noise during low vol
-        volatility_std = df['future_return'].std()
-        
-        if pd.isna(volatility_std):
-            threshold = 0.001
-        else:
-            # Stricter threshold: 1.5 std devs to filter more noise
-            threshold = max(0.001, volatility_std * 1.5)
-            
-        # Initialize target as Neutral (0)
-        df['target'] = 0
-        
-        # Apply Pump (1) and Dump (2) labels
-        df.loc[df['future_return'] > threshold, 'target'] = 1
-        df.loc[df['future_return'] < -threshold, 'target'] = 2 
-        
         return df
 
-    def get_model_file(self, symbol):
-        """Get model filename for a specific symbol"""
-        return f"lgb_model_{symbol.upper()}_v6.txt"
-    
-    def load_model_if_valid(self, symbol, max_age_days=7):
-        """Load model for a symbol if it exists and is younger than max_age_days"""
-        model_file = self.get_model_file(symbol)
-        if not os.path.exists(model_file):
-            return False
-            
-        try:
-            # Check file age
-            file_time = os.path.getmtime(model_file)
-            file_age = datetime.now() - datetime.fromtimestamp(file_time)
-            
-            if file_age.days >= max_age_days:
-                logger.info(f"Model for {symbol} found but too old ({file_age.days} days). Retraining...")
-                return False
-                
-            logger.info(f"Loading saved model for {symbol} (Age: {file_age})...")
-            self.models[symbol] = lgb.Booster(model_file=model_file)
-            return True
-        except Exception as e:
-            logger.error(f"Error loading model for {symbol}: {e}")
-            return False
+    # ------------------------------------------------------------------------
+    # MODEL LOADING & TRAINING
+    # ------------------------------------------------------------------------
+    def get_meta_model_file(self, symbol):
+        return f"meta_model_{symbol.upper()}.txt"
 
-    def train_model(self, symbol, df):
-        logger.info(f"Training model for {symbol}...")
-        df = self.prepare_features(df)
-        
-        # Drop last rows with NaN targets
-        df = df.dropna(subset=['target', 'future_return'] + self.feature_cols)
-        
-        if len(df) < 10:
-            logger.warning(f"Not enough data after feature engineering to train model for {symbol}. Rows: {len(df)}")
+    def clean_up_training_data(self, df):
+        """Cleans up training data, removing toxic/absolute columns"""
+        # 1. Non-normalized / Absolute columns to drop
+        non_normalized_cols = [
+            'open', 'high', 'low', 'close', 'vwap',
+            'total_volume', 'buy_volume', 'sell_volume',
+            'delta', 'delta_ma_10', 'volume_ma_20', 'avg_trade_size',
+            'duration_mean', 'duration_std', 'rolling_max_delta', 'rolling_min_delta'
+        ]
+        # 2. Target columns (Leaks)
+        targets = ['tbm_label', 'meta_label', 'returns', 'log_ret']
+        # 3. Metadata
+        metadata = ['symbol', 'start_ts', 'primary_signal', 'primary_direction', 'largest_trade_side']
+
+        drop_list = non_normalized_cols + targets + metadata
+        X = df.drop(columns=drop_list, errors='ignore')
+        return X
+
+    def train_meta_model(self, symbol, csv_path):
+        logger.info(f"Training Meta-Model for {symbol}...")
+        if not os.path.exists(csv_path):
             return None
 
-        X = df[self.feature_cols]
-        y = df['target']
-        
-        # Split
-        try:
-            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
-        except ValueError as e:
-            logger.error(f"Error splitting data for {symbol}: {e}")
+        df = pd.read_csv(csv_path)
+        # Filter for primary signals only
+        df = df[df['primary_signal'] == 1].copy()
+
+        # Save Target before cleaning
+        if 'meta_label' not in df.columns:
+            logger.error("meta_label missing")
             return None
-        
+        y = df['meta_label']
+
+        # Clean features
+        X = self.clean_up_training_data(df)
+
+        # Ensure correct features exist
+        missing = [f for f in self.feature_cols if f not in X.columns]
+        if missing:
+            logger.error(f"Missing features: {missing}")
+            return None
+
+        X = X[self.feature_cols]
+
+        # Train
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
         train_data = lgb.Dataset(X_train, label=y_train)
         test_data = lgb.Dataset(X_test, label=y_test, reference=train_data)
-        
+
         params = {
-            'objective': 'multiclass',
-            'num_class': 3,
-            'metric': 'multi_logloss',
+            'objective': 'binary',
+            'metric': 'auc',
             'boosting_type': 'gbdt',
             'num_leaves': 31,
-            'learning_rate': 0.05,
-            'feature_fraction': 0.9,
+            'learning_rate': 0.01,
+            'feature_fraction': 0.8,
+            'bagging_fraction': 0.8,
+            'bagging_freq': 5,
             'verbose': -1
         }
-        
+
         model = lgb.train(
             params,
             train_data,
-            num_boost_round=100,
+            num_boost_round=1000,
             valid_sets=[test_data],
-            callbacks=[lgb.early_stopping(stopping_rounds=10)]
+            callbacks=[lgb.early_stopping(stopping_rounds=50)]
         )
-        
-        # Evaluate
+
+        # Dynamic Threshold Optimization
         y_pred = model.predict(X_test)
-        y_pred_class = [np.argmax(x) for x in y_pred]
-        logger.info(f"Model evaluation:\n{classification_report(y_test, y_pred_class, zero_division=0)}")
-        
-        # Save model
-        model_file = self.get_model_file(symbol)
-        try:
-            model.save_model(model_file)
-            logger.info(f"Model for {symbol} saved to {model_file}")
-        except Exception as e:
-            logger.error(f"Failed to save model for {symbol}: {e}")
-        
-        # Store in models dict
-        self.models[symbol] = model
+        best_thresh = 0.5
+        best_precision = 0.0
+
+        for thresh in np.arange(0.3, 0.7, 0.01):
+            preds = (y_pred >= thresh).astype(int)
+            if preds.sum() < 10: continue
+
+            prec = precision_score(y_test, preds, zero_division=0)
+            rec = recall_score(y_test, preds, zero_division=0)
+
+            if rec >= 0.10 and prec > best_precision:
+                best_precision = prec
+                best_thresh = thresh
+
+        logger.info(f"{symbol} Best Threshold: {best_thresh:.2f} (Precision: {best_precision:.2%})")
+
+        model.save_model(self.get_meta_model_file(symbol))
+        self.meta_models[symbol] = model
         return model
 
-    def get_lstm_model_file(self, symbol):
-        return f"lstm_model_{symbol.upper()}.keras"
+    def load_meta_models(self):
 
-    def get_lstm_scaler_file(self, symbol):
-        return f"lstm_scaler_{symbol.upper()}.pkl"
+        for symbol in self.symbols:
+            f = self.get_meta_model_file(symbol)
+            dataset_path = f"meta_labeling_dataset_{symbol}.csv"
 
-    def load_lstm_model_if_valid(self, symbol, max_age_days=3):
-        """Load LSTM model and scaler if valid"""
-        if not self.ENABLE_LSTM:
-            return False
-            
-        model_file = self.get_lstm_model_file(symbol)
-        scaler_file = self.get_lstm_scaler_file(symbol)
-        
-        if not os.path.exists(model_file) or not os.path.exists(scaler_file):
-            return False
-            
-        try:
-            # Check file age
-            file_time = os.path.getmtime(model_file)
-            file_age = datetime.now() - datetime.fromtimestamp(file_time)
-            
-            if file_age.days >= max_age_days:
-                logger.info(f"LSTM Model for {symbol} found but too old ({file_age.days} days). Retraining...")
-                return False
+            # Retrain if dataset exists, else load
+            if os.path.exists(dataset_path):
+                logger.info(f"Found dataset for {symbol}. Training...")
+                self.train_meta_model(symbol, dataset_path)
+            elif os.path.exists(f):
+                logger.info(f"Loading model for {symbol}...")
+                self.meta_models[symbol] = lgb.Booster(model_file=f)
+            else:
+                logger.warning(f"No model or dataset found for {symbol}. Generating new dataset and training model...")
                 
-            logger.info(f"Loading saved LSTM model for {symbol} (Age: {file_age})...")
-            self.lstm_models[symbol] = tf.keras.models.load_model(model_file)
-            self.lstm_scalers[symbol] = joblib.load(scaler_file)
-            return True
-        except Exception as e:
-            logger.error(f"Error loading LSTM model for {symbol}: {e}")
-            return False
-
-    def train_lstm_model(self, symbol, df):
-        """Train an LSTM model for the given symbol"""
-        if not self.ENABLE_LSTM:
-            return
-
-        logger.info(f"Training LSTM model for {symbol}...")
-        
-        try:
-            # Prepare data
-            df = self.prepare_features(df)
-            df = df.dropna(subset=['target'] + self.feature_cols)
-            
-            if len(df) < 200:
-                logger.warning(f"Not enough data for LSTM training for {symbol}. Need at least 200 rows.")
-                return
-
-            # Limit data size to prevent OOM
-            if len(df) > 50000:
-                logger.info(f"Limiting LSTM training data to last 50,000 rows (Total: {len(df)}) to prevent OOM.")
-                df = df.iloc[-50000:]
-
-            # Scale features
-            scaler = MinMaxScaler()
-            feature_data = df[self.feature_cols].values
-            scaled_data = scaler.fit_transform(feature_data)
-            
-            # Save scaler
-            scaler_path = self.get_lstm_scaler_file(symbol)
-            joblib.dump(scaler, scaler_path)
-            self.lstm_scalers[symbol] = scaler
-            
-            # Prepare sequences
-            SEQ_LEN = 200
-            X = []
-            y = []
-            
-            targets = df['target'].values
-            
-            for i in range(SEQ_LEN, len(scaled_data)):
-                X.append(scaled_data[i-SEQ_LEN:i])
-                y.append(targets[i])
+                # Initialize DatasetLabeler to generate new dataset
+                labeler = DatasetLabeler()
                 
-            X = np.array(X)
-            y = np.array(y)
-            
-            # Split data
-            train_size = int(len(X) * 0.8)
-            X_train, X_test = X[:train_size], X[train_size:]
-            y_train, y_test = y[:train_size], y[train_size:]
-            
-            # Build model
-            model = tf.keras.Sequential([
-                tf.keras.layers.Input(shape=(X_train.shape[1], X_train.shape[2])),
-                tf.keras.layers.LSTM(50, return_sequences=True),
-                tf.keras.layers.Dropout(0.2),
-                tf.keras.layers.LSTM(50, return_sequences=False),
-                tf.keras.layers.Dropout(0.2),
-                tf.keras.layers.Dense(25, activation='relu'),
-                tf.keras.layers.Dense(3, activation='softmax')
-            ])
-            
-            model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
-            
-            # Train
-            model.fit(X_train, y_train, batch_size=64, epochs=5, validation_data=(X_test, y_test), verbose=1)
-            
-            # Save
-            model_path = self.get_lstm_model_file(symbol)
-            model.save(model_path)
-            self.lstm_models[symbol] = model
-            logger.info(f"LSTM model for {symbol} saved to {model_path}")
-            
-        except Exception as e:
-            logger.error(f"Error training LSTM for {symbol}: {e}")
-
-    def check_model_age(self, symbol, model_type='lgbm'):
-        """
-        Check if a model needs retraining based on age.
-        Returns (needs_retrain, age_days)
-        """
-        try:
-            if model_type == 'lgbm':
-                model_file = self.get_model_file(symbol)
-            else:  # lstm
-                model_file = self.get_lstm_model_file(symbol)
-            
-            if not os.path.exists(model_file):
-                logger.info(f"{model_type.upper()} model for {symbol} does not exist. Needs training.")
-                return (True, None)
-            
-            file_time = os.path.getmtime(model_file)
-            file_age = datetime.now() - datetime.fromtimestamp(file_time)
-            age_days = file_age.days
-            
-            if age_days >= self.RETRAIN_MAX_AGE_DAYS:
-                logger.info(f"{model_type.upper()} model for {symbol} is {age_days} days old (>= {self.RETRAIN_MAX_AGE_DAYS}). Needs retraining.")
-                return (True, age_days)
-            
-            return (False, age_days)
-        except Exception as e:
-            logger.error(f"Error checking model age for {symbol} ({model_type}): {e}")
-            return (False, None)
-
-    def background_retrain_check(self):
-        """
-        Background thread function that periodically checks model ages and triggers retraining.
-        Runs every RETRAIN_CHECK_INTERVAL seconds.
-        """
-        logger.info(f"Background retraining scheduler started. Checking every {self.RETRAIN_CHECK_INTERVAL / 3600:.1f} hours for models >= {self.RETRAIN_MAX_AGE_DAYS} days old.")
-        
-        while not self.retraining_stop_event.is_set():
-            # Wait for the check interval (or until stop event is set)
-            if self.retraining_stop_event.wait(timeout=self.RETRAIN_CHECK_INTERVAL):
-                break  # Stop event was set
-            
-            logger.info("Running scheduled model age check...")
-            
-            try:
-                # Check each symbol's models
-                symbols_needing_retrain = {'lgbm': [], 'lstm': []}
-                
-                for symbol in self.symbols:
-                    # Check LGBM model
-                    needs_retrain_lgbm, age_lgbm = self.check_model_age(symbol, 'lgbm')
-                    if needs_retrain_lgbm:
-                        symbols_needing_retrain['lgbm'].append(symbol)
-                    
-                    # Check LSTM model (if enabled)
-                    if self.ENABLE_LSTM:
-                        needs_retrain_lstm, age_lstm = self.check_model_age(symbol, 'lstm')
-                        if needs_retrain_lstm:
-                            symbols_needing_retrain['lstm'].append(symbol)
-                
-                # If any models need retraining, fetch data and retrain
-                if symbols_needing_retrain['lgbm'] or symbols_needing_retrain['lstm']:
-                    logger.info(f"Models needing retraining - LGBM: {symbols_needing_retrain['lgbm']}, LSTM: {symbols_needing_retrain['lstm']}")
-                    
-                    # Send Telegram notification
-                    try:
-                        retrain_msg = f"🔄 <b>Automatic Retraining Triggered</b>\n"
-                        if symbols_needing_retrain['lgbm']:
-                            retrain_msg += f"LGBM: {', '.join([s.upper() for s in symbols_needing_retrain['lgbm']])}\n"
-                        if symbols_needing_retrain['lstm']:
-                            retrain_msg += f"LSTM: {', '.join([s.upper() for s in symbols_needing_retrain['lstm']])}"
-                        self.send_telegram_message(retrain_msg)
-                    except Exception as e:
-                        logger.error(f"Failed to send retraining notification: {e}")
-                    
-                    # Fetch data for retraining (5 days + golden dataset)
-                    logger.info("Fetching historical data for retraining...")
-                    df = self.fetch_historical_data(self.symbols, days=5, fetch_golden=True)
-                    
-                    if not df.empty and len(df) > 10:
-                        # Retrain LGBM models
-                        for symbol in symbols_needing_retrain['lgbm']:
-                            symbol_df = df[df['symbol'] == symbol.upper()].copy()
-                            if len(symbol_df) > 10:
-                                logger.info(f"Retraining LGBM model for {symbol.upper()}...")
-                                self.train_model(symbol.upper(), symbol_df)
-                                logger.info(f"✓ LGBM Model retrained for {symbol.upper()}")
-                            else:
-                                logger.warning(f"Not enough data for {symbol.upper()}. Skipping LGBM retraining.")
-                        
-                        # Retrain LSTM models
-                        if self.ENABLE_LSTM:
-                            for symbol in symbols_needing_retrain['lstm']:
-                                symbol_df = df[df['symbol'] == symbol.upper()].copy()
-                                if len(symbol_df) > 200:
-                                    logger.info(f"Retraining LSTM model for {symbol.upper()}...")
-                                    self.train_lstm_model(symbol.upper(), symbol_df)
-                                    logger.info(f"✓ LSTM Model retrained for {symbol.upper()}")
-                                else:
-                                    logger.warning(f"Not enough data for {symbol.upper()}. Skipping LSTM retraining.")
-                        
-                        # Send completion notification
-                        try:
-                            completion_msg = "✅ <b>Automatic Retraining Completed</b>"
-                            self.send_telegram_message(completion_msg)
-                        except:
-                            pass
-                    else:
-                        logger.warning("Not enough historical data fetched for retraining.")
-                        try:
-                            self.send_telegram_message("⚠️ <b>Retraining Failed</b>\nNot enough historical data.")
-                        except:
-                            pass
-                else:
-                    logger.info("All models are up to date. No retraining needed.")
-                    
-            except Exception as e:
-                logger.error(f"Error in background retraining check: {e}", exc_info=True)
-                try:
-                    self.send_telegram_message(f"❌ <b>Retraining Error</b>\n{str(e)}")
-                except:
-                    pass
-        
-        logger.info("Background retraining scheduler stopped.")
-
-    def start_retraining_scheduler(self):
-        """Start the background retraining scheduler thread"""
-        if self.retraining_thread is not None and self.retraining_thread.is_alive():
-            logger.warning("Retraining scheduler thread is already running.")
-            return
-        
-        self.retraining_stop_event.clear()
-        self.retraining_thread = threading.Thread(target=self.background_retrain_check, daemon=True, name="RetrainingScheduler")
-        self.retraining_thread.start()
-        logger.info("Retraining scheduler thread started.")
-
-    def on_message(self, ws, message):
-        # Skip empty or non-string messages
-        if not message or not isinstance(message, (str, bytes)):
-            return
-        
-        # Convert bytes to string if needed
-        if isinstance(message, bytes):
-            try:
-                message = message.decode('utf-8')
-            except UnicodeDecodeError:
-                return
-        
-        # Skip empty strings after decoding
-        message = message.strip()
-        if not message:
-            return
-        
-        # Try to parse JSON
-        try:
-            data = json.loads(message)
-        except json.JSONDecodeError as e:
-            # Skip non-JSON messages (ping/pong, connection frames, etc.)
-            return
-        
-        # Extract symbol from data
-        symbol = data.get('symbol', '').lower()
-        if not symbol or symbol not in self.symbols:
-            return  # Skip data for unknown symbols
-        
-        with self.lock:
-            # Append to symbol-specific data
-            self.latest_data[symbol].append(data)
-            if len(self.latest_data[symbol]) > 20000: # Keep last 20000 bars for feature calc and 15m resampling
-                self.latest_data[symbol].pop(0)
-                
-            if len(self.latest_data[symbol]) >= 200: # Need enough data for rolling features and LSTM
-                # Optimize: Only take last 300 rows for feature calculation to avoid processing 20k rows every ms
-                # We need at least 200 for LSTM + some buffer for rolling window calculations
-                recent_data = self.latest_data[symbol][-300:]
-                df = pd.DataFrame(recent_data)
-                df = self.prepare_features(df) # This adds features to all rows
-                
-                # Get last row
-                last_row = df.iloc[-1]
-                
-                # Check if model exists for this symbol
-                if symbol not in self.models or self.models[symbol] is None:
-                    return
-                
-                # Predict (LightGBM)
-                features = last_row[self.feature_cols].values.reshape(1, -1)
-                prediction = self.models[symbol].predict(features)
-                pred_class = np.argmax(prediction[0])
-                probs = prediction[0]
-                
-                # Predict (LSTM) if available
-                lstm_pred_class = -1
-                lstm_probs = [0.0, 0.0, 0.0]
-                lstm_direction = "N/A"
-                
-                # Throttle LSTM: Run only every 10th message
-                self.lstm_prediction_counters[symbol] += 1
-                should_run_lstm = (self.lstm_prediction_counters[symbol] % 10 == 0)
-                
-                if self.ENABLE_LSTM and symbol in self.lstm_models and symbol in self.lstm_scalers:
-                    if should_run_lstm:
-                        try:
-                            # Need last 200 rows for LSTM
-                            if len(df) >= 200:
-                                lstm_input_df = df.iloc[-200:]
-                                lstm_features = lstm_input_df[self.feature_cols].values
-                                # Scale
-                                lstm_scaled = self.lstm_scalers[symbol].transform(lstm_features)
-                                # Reshape to (1, 200, n_features)
-                                lstm_input = lstm_scaled.reshape(1, 200, lstm_scaled.shape[1])
-                                
-                                lstm_prediction = self.lstm_models[symbol].predict(lstm_input, verbose=0)
-                                lstm_pred_class = np.argmax(lstm_prediction[0])
-                                lstm_probs = lstm_prediction[0]
-                                
-                                direction_map = {0: "NEUTRAL", 1: "PUMP", 2: "DUMP"}
-                                lstm_direction = direction_map[lstm_pred_class]
-                                
-                                # Update cache
-                                self.last_lstm_predictions[symbol] = {
-                                    'direction': lstm_direction,
-                                    'probs': lstm_probs,
-                                    'pred_class': lstm_pred_class
-                                }
-                        except Exception as e:
-                            logger.error(f"LSTM prediction error for {symbol}: {e}")
-                    
-                    # Use cached/latest values
-                    cached = self.last_lstm_predictions[symbol]
-                    lstm_direction = cached['direction']
-                    lstm_probs = cached['probs']
-                    lstm_pred_class = cached['pred_class']
-                
-                timestamp = last_row['start_ts']
-                price = last_row['close']
-                
-                # Map prediction class to direction
-                direction_map = {0: "NEUTRAL", 1: "PUMP", 2: "DUMP"}
-                direction = direction_map[pred_class]
-                confidence = probs[pred_class]
-                
-                # Store the current prediction values for this symbol
-                self.last_prediction_data[symbol] = {
-                    'timestamp': timestamp,
-                    'price': price,
-                    'delta': last_row['delta'],
-                    'direction': direction,
-                    'confidence': confidence,
-                    'probs': {
-                        'NEUTRAL': float(probs[0]),
-                        'PUMP': float(probs[1]),
-                        'DUMP': float(probs[2])
-                    },
-                    'pred_class': int(pred_class),
-                    'lstm_direction': lstm_direction,
-                    'lstm_confidence': float(lstm_probs[lstm_pred_class]) if lstm_direction != "N/A" else 0.0,
-                    'lstm_probs': {
-                        'NEUTRAL': float(lstm_probs[0]),
-                        'PUMP': float(lstm_probs[1]),
-                        'DUMP': float(lstm_probs[2])
-                        } if lstm_direction != "N/A" else {'NEUTRAL': 0.0, 'PUMP': 0.0, 'DUMP': 0.0}
-                }
-
-                # Add to history for averaging (keep last 20)
-                self.prediction_history[symbol].append(self.last_prediction_data[symbol])
-                if len(self.prediction_history[symbol]) > 20:
-                    self.prediction_history[symbol].pop(0)
-
-                # Display all prediction results with full probability distribution
-                lstm_info = ""
-                if lstm_direction != "N/A":
-                    lstm_info = f" | LSTM: {lstm_direction} ({lstm_probs[lstm_pred_class]:.2%}) [N:{lstm_probs[0]:.0%} P:{lstm_probs[1]:.0%} D:{lstm_probs[2]:.0%}]"
-                    
-                logger.info(
-                    f"{symbol.upper()} | Price: ${price:.2f} | OFI: {last_row['delta']:.2f} | LGBM: {direction} ({confidence:.2%}){lstm_info} | NEUTRAL: {probs[0]:.2%} | PUMP: {probs[1]:.2%} | DUMP: {probs[2]:.2%}")
-
-                # Check if we should send initial status message
-                if not self.initial_message_sent:
-                    # Check if we have data for all symbols
-                    if all(self.last_prediction_data.get(s) for s in self.symbols):
-                        logger.info("Sending initial status message...")
-                        self.send_status_message("🚀 <b>Bot Started - Initial Status</b>")
-                        self.initial_message_sent = True
-
-                # Send Telegram notifications if conditions are met
-                self.check_and_send_notifications(
+                # Use prepare_training_dataset to generate labeled dataset
+                df = labeler.prepare_training_dataset(
                     symbol=symbol,
-                    timestamp=timestamp,
-                    price=price,
-                    delta=last_row['delta'],
-                    direction=direction,
-                    confidence=confidence,
-                    probs=probs
+                    days=300,
+                    primary_strategy='volume_imbalance',
+                    lookahead=int(os.getenv("LOOKAHEAD_PERIODS", "100")),
+                    tp_pct=float(os.getenv("TAKE_PROFIT_PCT", "0.0005")),
+                    sl_pct=float(os.getenv("STOP_LOSS_PCT", "0.00025"))
                 )
                 
-                # Update Market Regime Analysis
-                self.analyze_market_regime()
-
-    def analyze_market_regime(self):
-        """
-        Analyze the current market regime (BTC Season vs Alt Season) based on all symbols.
-        Stores the result in self.market_regime.
-        """
-        # Need data for all symbols to make a global decision
-        if not all(self.last_prediction_data.get(s) for s in self.symbols):
-            return
-
-        btc_data = self.last_prediction_data.get('btcusdt')
-        eth_data = self.last_prediction_data.get('ethusdt')
-        sol_data = self.last_prediction_data.get('solusdt')
-        
-        # If we don't have specific symbols, try to infer from what we have
-        # Assuming 'btcusdt' is always present as the anchor
-        if not btc_data:
-            return
-
-        alts_data = [self.last_prediction_data[s] for s in self.symbols if s != 'btcusdt']
-        
-        if not alts_data:
-            self.market_regime = {"season": "BTC_ONLY", "confidence": 0.0, "details": "Only BTC data available"}
-            return
-
-        # Metrics
-        avg_alt_ofi = np.mean([d['delta'] for d in alts_data])
-        
-        # --- NEW LOGIC: Use Average of Last 20 Predictions ---
-        # Instead of just current snapshot, let's calculate the average probabilities over the last 20 ticks
-        # This smooths out noise and gives a more robust "regime" signal.
-        
-        # Helper to get average metrics for a symbol from history
-        def get_avg_metrics(sym):
-            history = self.prediction_history.get(sym, [])
-            if not history:
-                return None
-            
-            # Calculate means
-            mean_pump = np.mean([item['probs']['PUMP'] for item in history])
-            mean_dump = np.mean([item['probs']['DUMP'] for item in history])
-            mean_ofi = np.mean([item['delta'] for item in history])
-            
-            # Calculate LSTM means (if available)
-            lstm_pumps = [item.get('lstm_probs', {}).get('PUMP', 0.0) for item in history if item.get('lstm_direction', 'N/A') != 'N/A']
-            lstm_dumps = [item.get('lstm_probs', {}).get('DUMP', 0.0) for item in history if item.get('lstm_direction', 'N/A') != 'N/A']
-            
-            mean_lstm_pump = np.mean(lstm_pumps) if lstm_pumps else 0.0
-            mean_lstm_dump = np.mean(lstm_dumps) if lstm_dumps else 0.0
-            
-            return {
-                'pump': mean_pump,
-                'dump': mean_dump,
-                'ofi': mean_ofi,
-                'lstm_pump': mean_lstm_pump,
-                'lstm_dump': mean_lstm_dump
-            }
-
-        # Initialize variables
-        btc_pump_prob = 0.0
-        btc_dump_prob = 0.0
-        btc_ofi = 0.0
-        
-        avg_alt_pump_prob = 0.0
-        avg_alt_dump_prob = 0.0
-        avg_alt_ofi = 0.0
-
-        # Calculate averages for BTC
-        btc_avgs = get_avg_metrics('btcusdt')
-        if btc_avgs:
-            btc_pump_prob = btc_avgs['pump']
-            btc_dump_prob = btc_avgs['dump']
-            btc_ofi = btc_avgs['ofi']
-        
-        # Calculate averages for Alts (aggregate of all alt histories)
-        alt_pump_probs = []
-        alt_dump_probs = []
-        alt_ofis = []
-        
-        for s in self.symbols:
-            if s != 'btcusdt':
-                avgs = get_avg_metrics(s)
-                if avgs:
-                    alt_pump_probs.append(avgs['pump'])
-                    alt_dump_probs.append(avgs['dump'])
-                    alt_ofis.append(avgs['ofi'])
-        
-        if alt_pump_probs:
-            avg_alt_pump_prob = np.mean(alt_pump_probs)
-            avg_alt_dump_prob = np.mean(alt_dump_probs)
-            avg_alt_ofi = np.mean(alt_ofis)
-        
-        # --- BTC DOMINANCE PROXY ---
-        # Calculate relative strength of BTC vs Alts
-        # Positive = BTC Stronger (Dominance Rising)
-        # Negative = Alts Stronger (Dominance Falling)
-        btc_dominance_proxy = (btc_pump_prob - btc_dump_prob) - (avg_alt_pump_prob - avg_alt_dump_prob)
-        
-        # Determine Season
-        season = "NEUTRAL"
-        confidence = 0.0
-        details = ""
-        
-        # 1. BEAR MARKET: Everything is dumping
-        if btc_dump_prob > 0.5 and avg_alt_dump_prob > 0.5:
-            season = "BEAR_MARKET"
-            confidence = (btc_dump_prob + avg_alt_dump_prob) / 2
-            details = "Global sell-off detected."
-            
-        # 2. BULL MARKET: Everything is pumping
-        elif btc_pump_prob > 0.5 and avg_alt_pump_prob > 0.5:
-            season = "BULL_MARKET"
-            confidence = (btc_pump_prob + avg_alt_pump_prob) / 2
-            details = "Global rally detected."
-            
-        # 3. BTC SEASON (Dominance Rising)
-        elif btc_dominance_proxy > 0.15:
-            season = "BTC_SEASON"
-            confidence = abs(btc_dominance_proxy)
-            details = f"Money flowing into BTC (Dom Proxy: {btc_dominance_proxy:.2f})"
-            
-        # 4. ALT SEASON (Dominance Falling)
-        elif btc_dominance_proxy < -0.15:
-            season = "ALT_SEASON"
-            confidence = abs(btc_dominance_proxy)
-            details = f"Money flowing into Alts (Dom Proxy: {btc_dominance_proxy:.2f})"
-            
-        # 5. DIVERGENCE: BTC Dumping, Alts Pumping (Rare/Risky)
-        elif btc_dump_prob > 0.6 and avg_alt_pump_prob > 0.5:
-            season = "DIVERGENCE_RISK"
-            confidence = (btc_dump_prob + avg_alt_pump_prob) / 2
-            details = "BTC dumping while Alts pump. High risk."
-            
-        else:
-            # 6. NEUTRAL / CHOPPY
-            season = "NEUTRAL"
-            # Confidence in neutrality can be seen as how "un-extreme" the signals are.
-            # We take the maximum signal strength seen so far and invert it.
-            max_signal = max(btc_pump_prob, btc_dump_prob, avg_alt_pump_prob, avg_alt_dump_prob, abs(btc_dominance_proxy))
-            confidence = 1.0 - min(max_signal, 1.0) 
-            details = "No strong trend detected. Market is ranging or indecisive."
-            
-        # --- HEDGE FUND DATA BROADCAST ---
-        # Calculate scores for the hedge bot
-        
-        # 1. Market Regime Score (-1.0 to 1.0)
-        # Bullish = +1, Bearish = -1
-        # We use the aggregate pump - dump probability
-        # BTC weight 50%, Alts weight 50%
-        btc_net_score = btc_pump_prob - btc_dump_prob
-        alt_net_score = avg_alt_pump_prob - avg_alt_dump_prob
-        market_regime_score = (btc_net_score + alt_net_score) / 2
-        
-        # 2. Spread Matrix (Relative Strength)
-        # We need individual strengths
-        # If we have specific alts, calculate their specific scores
-        eth_avgs = get_avg_metrics('ethusdt')
-        sol_avgs = get_avg_metrics('solusdt')
-        
-        # Helper to calculate composite score (LGBM + LSTM)
-        def calc_composite_score(avgs):
-            if not avgs: return 0.0
-            lgbm_score = avgs['pump'] - avgs['dump']
-            lstm_score = avgs['lstm_pump'] - avgs['lstm_dump']
-            # Weight: 70% LGBM, 30% LSTM (since LSTM is throttled/slower)
-            if lstm_score != 0:
-                return (lgbm_score * 0.7) + (lstm_score * 0.3)
-            return lgbm_score
-            
-        def get_direction_label(score):
-            if score > 0.05: return "PUMP"
-            if score < -0.05: return "DUMP"
-            return "NEUTRAL"
-        
-        btc_comp_score = calc_composite_score(btc_avgs)
-        eth_comp_score = calc_composite_score(eth_avgs)
-        sol_comp_score = calc_composite_score(sol_avgs)
-        
-        # Calculate raw sub-scores for labeling
-        btc_lgbm = btc_pump_prob - btc_dump_prob
-        btc_lstm = (btc_avgs['lstm_pump'] - btc_avgs['lstm_dump']) if btc_avgs else 0.0
-        
-        eth_lgbm = (eth_avgs['pump'] - eth_avgs['dump']) if eth_avgs else 0.0
-        eth_lstm = (eth_avgs['lstm_pump'] - eth_avgs['lstm_dump']) if eth_avgs else 0.0
-        
-        sol_lgbm = (sol_avgs['pump'] - sol_avgs['dump']) if sol_avgs else 0.0
-        sol_lstm = (sol_avgs['lstm_pump'] - sol_avgs['lstm_dump']) if sol_avgs else 0.0
-        
-        spread_matrix = {
-            "btc_vs_eth": btc_comp_score - eth_comp_score, # >0 means BTC stronger
-            "btc_vs_sol": btc_comp_score - sol_comp_score,
-            "eth_vs_sol": eth_comp_score - sol_comp_score
-        }
-        
-        hedge_payload = {
-            "timestamp": datetime.now().isoformat(),
-            "market_regime": {
-                "season": season,
-                "score": float(market_regime_score), # -1.0 (Bear) to 1.0 (Bull)
-                "confidence": float(confidence),
-                "details": details
-            },
-            "btc_dominance": {
-                "score": float(btc_dominance_proxy), # >0 Rising, <0 Falling
-                "trend": "RISING" if btc_dominance_proxy > 0.05 else "FALLING" if btc_dominance_proxy < -0.05 else "NEUTRAL"
-            },
-            "spread_matrix": spread_matrix,
-            "assets": {
-                "btc": {
-                    "score": float(btc_comp_score),
-                    "direction": get_direction_label(btc_comp_score),
-                    "lgbm_score": float(btc_lgbm),
-                    "lgbm_direction": get_direction_label(btc_lgbm),
-                    "lstm_score": float(btc_lstm),
-                    "lstm_direction": get_direction_label(btc_lstm),
-                    "ofi": float(btc_ofi)
-                },
-                "eth": {
-                    "score": float(eth_comp_score),
-                    "direction": get_direction_label(eth_comp_score),
-                    "lgbm_score": float(eth_lgbm),
-                    "lgbm_direction": get_direction_label(eth_lgbm),
-                    "lstm_score": float(eth_lstm),
-                    "lstm_direction": get_direction_label(eth_lstm),
-                    "ofi": float(eth_avgs['ofi'])
-                } if eth_avgs else {},
-                "sol": {
-                    "score": float(sol_comp_score),
-                    "direction": get_direction_label(sol_comp_score),
-                    "lgbm_score": float(sol_lgbm),
-                    "lgbm_direction": get_direction_label(sol_lgbm),
-                    "lstm_score": float(sol_lstm),
-                    "lstm_direction": get_direction_label(sol_lstm),
-                    "ofi": float(sol_avgs['ofi'])
-                } if sol_avgs else {}
-            }
-        }
-        
-        # Broadcast to WebSocket clients
-        self.broadcast_hedge_data(hedge_payload)
-
-        # Check for change
-        previous_season = self.market_regime.get("season", "NEUTRAL")
-        previous_dom_trend = self.market_regime.get("dominance_trend", "NEUTRAL")
-        
-        current_dom_trend = hedge_payload["btc_dominance"]["trend"]
-        
-        # Store state
-        self.market_regime = {
-            "season": season,
-            "dominance_trend": current_dom_trend,
-            "confidence": confidence,
-            "details": details,
-            "metrics": {
-                "btc_pump": btc_pump_prob,
-                "alt_pump": avg_alt_pump_prob,
-                "btc_ofi": btc_ofi,
-                "alt_ofi": avg_alt_ofi
-            },
-            "timestamp": datetime.now()
-        }
-        
-        # Log significant changes
-        if season != previous_season:
-            logger.info(f"Market Regime Change: {previous_season} -> {season} | Dom: {previous_dom_trend} -> {current_dom_trend}")
-            
-            # Send nice formatted message
-            msg = f"🔄 <b>Market Regime Update</b>\n\n"
-            if season != previous_season:
-                msg += f"Season: {previous_season} ➡️ <b>{season}</b>\n"
-            else:
-                msg += f"Season: <b>{season}</b> (Unchanged)\n"
+                if df.empty or len(df) < 100:
+                    logger.error(f"❌ Not enough data generated for {symbol}. Cannot train model.")
+                    continue
                 
-            if current_dom_trend != previous_dom_trend:
-                msg += f"BTC Dominance: {previous_dom_trend} ➡️ <b>{current_dom_trend}</b>\n"
-            else:
-                msg += f"BTC Dominance: <b>{current_dom_trend}</b> (Unchanged)\n"
+                # Save dataset for training (keep only rows with primary signals)
+                training_data = df[df['primary_signal'] == 1].copy()
+                training_data.to_csv(dataset_path, index=False)
+                logger.info(f"✅ Saved new dataset to {dataset_path} ({len(training_data)} samples)")
+                
+                # Train model using the new dataset
+                self.train_meta_model(symbol, dataset_path)
+
+
+    # ------------------------------------------------------------------------
+    # ORDER FLOW STRATEGY INTEGRATION
+    # ------------------------------------------------------------------------
+    def _check_orderflow_signal(self, symbol: str, df: pd.DataFrame) -> dict:
+        """
+        Check for order flow signals using the OrderFlowStrategy.
+        
+        Args:
+            symbol: Trading symbol (e.g., 'btcusdt')
+            df: DataFrame with market features already calculated
             
-            msg += f"\nConfidence: {confidence:.2%}\n"
-            msg += f"Details: {details}\n\n"
-            msg += f"📋 <b>API Payload:</b>\n"
-            msg += f"<pre>{json.dumps(hedge_payload, indent=2)}</pre>"
+        Returns:
+            Signal dictionary with 'signal', 'confidence', 'reason' keys
+        """
+        try:
+            # Prepare DataFrame for OrderFlowStrategy
+            # It requires: timestamp, open, high, low, close, total_volume, taker_buy_volume
+            required_cols = ['open', 'high', 'low', 'close', 'total_volume', 'taker_buy_volume']
+            
+            # Check if all required columns exist
+            missing_cols = [col for col in required_cols if col not in df.columns]
+            if missing_cols:
+                logger.debug(f"Order Flow: Missing columns for {symbol}: {missing_cols}")
+                return {'signal': None, 'confidence': 0.0, 'reason': 'Missing required columns'}
+            
+            # Create OrderFlow-compatible DataFrame
+            of_df = df[['open', 'high', 'low', 'close', 'total_volume', 'taker_buy_volume']].copy()
+            
+            # Add timestamp column (use index if not present)
+            if 'start_ts' in df.columns:
+                of_df['timestamp'] = df['start_ts']
+            else:
+                of_df['timestamp'] = pd.date_range(end=datetime.now(), periods=len(of_df), freq='1min')
+            
+            # Need at least 40 candles for proper analysis
+            if len(of_df) < 40:
+                return {'signal': None, 'confidence': 0.0, 'reason': 'Insufficient data'}
+            
+            # Get order flow signal
+            signal_result = self.orderflow_strategy.get_signal(of_df)
+            
+            # Apply cooldown to avoid signal spam
+            if signal_result['signal']:
+                now = datetime.now()
+                cooldown_seconds = 300  # 5 minute cooldown between same signals
+                
+                # Check if we're in cooldown for this signal type
+                last_signal = self.last_orderflow_signal.get(symbol)
+                last_time = self.orderflow_signal_cooldown.get(symbol)
+                
+                if last_signal == signal_result['signal'] and last_time:
+                    elapsed = (now - last_time).total_seconds()
+                    if elapsed < cooldown_seconds:
+                        logger.debug(f"Order Flow: {symbol} signal in cooldown ({elapsed:.0f}s / {cooldown_seconds}s)")
+                        return {'signal': None, 'confidence': 0.0, 'reason': 'Signal in cooldown'}
+                
+                # Update tracking
+                self.last_orderflow_signal[symbol] = signal_result['signal']
+                self.orderflow_signal_cooldown[symbol] = now
+                
+                # Log the detected signal
+                logger.info(
+                    f"📈 {symbol.upper()} | ORDER FLOW SIGNAL | "
+                    f"{signal_result['signal']} | Conf: {signal_result['confidence']:.1%} | "
+                    f"{signal_result['reason']}"
+                )
+            
+            return signal_result
+            
+        except Exception as e:
+            logger.error(f"Order Flow error for {symbol}: {e}")
+            return {'signal': None, 'confidence': 0.0, 'reason': f'Error: {str(e)}'}
+    
+    def get_orderflow_analysis(self, symbol: str) -> dict:
+        """
+        Get comprehensive order flow analysis for a symbol.
+        Useful for debugging and monitoring.
+        
+        Args:
+            symbol: Trading symbol
+            
+        Returns:
+            Full analysis dictionary from OrderFlowStrategy
+        """
+        with self.lock:
+            if symbol not in self.latest_data or len(self.latest_data[symbol]) < 40:
+                return {'error': 'Insufficient data'}
+            
+            df = pd.DataFrame(self.latest_data[symbol][-200:])
+            
+            # Ensure numeric types
+            cols = ['close', 'open', 'high', 'low', 'total_volume', 'taker_buy_volume']
+            for c in cols:
+                if c in df.columns:
+                    df[c] = pd.to_numeric(df[c], errors='coerce')
+            
+            # Create OrderFlow-compatible DataFrame
+            of_df = df[['open', 'high', 'low', 'close', 'total_volume', 'taker_buy_volume']].copy()
+            if 'start_ts' in df.columns:
+                of_df['timestamp'] = df['start_ts']
+            else:
+                of_df['timestamp'] = pd.date_range(end=datetime.now(), periods=len(of_df), freq='1min')
+            
+            return self.orderflow_strategy.get_analysis_summary(of_df)
+    
+    def execute_orderflow_trade(self, symbol: str, signal_result: dict, current_price: float) -> bool:
+        """
+        Execute a paper trade based on Order Flow signal with custom stop loss.
+        
+        This creates trades with pattern-specific stop losses:
+        - DIVERGENCE: Stop above/below recent high/low
+        - ABSORPTION: Stop just beyond absorption level  
+        - MOMENTUM: Trailing stop based on ATR
+        
+        Args:
+            symbol: Trading symbol
+            signal_result: Signal dictionary from OrderFlowStrategy with trade_setup
+            current_price: Current price for entry
+            
+        Returns:
+            True if trade was opened, False otherwise
+        """
+        if not signal_result or not signal_result.get('signal'):
+            return False
+        
+        trade_setup = signal_result.get('trade_setup')
+        if not trade_setup:
+            logger.warning(f"Order Flow signal without trade setup for {symbol}")
+            return False
+        
+        signal_side = signal_result['signal']
+        confidence = signal_result['confidence']
+        pattern_type = trade_setup.get('pattern_type', 'UNKNOWN')
+        stop_loss = trade_setup.get('stop_loss', 0)
+        stop_loss_pct = trade_setup.get('stop_loss_pct', 0.01)  # Default 1%
+        entry_trigger = trade_setup.get('entry_trigger', '')
+        
+        # Check if we already have an open position
+        if self.paper_trader.has_open_position(symbol):
+            # Check if this is a reversal signal
+            active_trade = self.paper_trader.active_trades.get(symbol)
+            if active_trade and active_trade['side'] != signal_side:
+                logger.info(f"📊 {symbol.upper()} | Order Flow REVERSAL detected | {active_trade['side']} -> {signal_side}")
+                # Close existing trade first - calculate PnL
+                if active_trade['side'] == 'LONG':
+                    pnl = (current_price - active_trade['entry_price']) / active_trade['entry_price']
+                else:
+                    pnl = (active_trade['entry_price'] - current_price) / active_trade['entry_price']
+                self.paper_trader.close_trade(symbol, current_price, f"OF_{pattern_type}_REVERSAL", pnl, datetime.now())
+            else:
+                logger.debug(f"Order Flow: {symbol} already has position in same direction")
+                return False
+        
+        # Calculate custom stop loss percentage
+        # Limit stop loss to reasonable bounds
+        stop_loss_pct = max(0.002, min(stop_loss_pct, 0.05))  # Between 0.2% and 5%
+        
+        # Temporarily modify paper trader stop loss for this trade
+        original_sl_pct = self.paper_trader.SL_PCT
+        original_tsl_pct = self.paper_trader.TSL_PCT
+        
+        # For MOMENTUM trades, use tighter trailing stops
+        if pattern_type == 'MOMENTUM':
+            self.paper_trader.SL_PCT = stop_loss_pct
+            self.paper_trader.TSL_PCT = stop_loss_pct * 0.75  # Tighter trailing
+        else:
+            # For ABSORPTION and DIVERGENCE, use the calculated stop
+            self.paper_trader.SL_PCT = stop_loss_pct
+            self.paper_trader.TSL_PCT = stop_loss_pct * 1.5  # Wider trailing for reversals
+        
+        try:
+            # Open the trade
+            self.paper_trader.open_trade(
+                symbol=symbol,
+                side=signal_side,
+                price=current_price,
+                timestamp=datetime.now()
+            )
+            
+            # Populate Shadow Ledger with Order Flow specific info
+            self.active_trades[symbol] = {
+                'entry_price': current_price,
+                'start_time': datetime.now(),
+                'side': signal_side,
+                'source': 'ORDERFLOW',
+                'pattern_type': pattern_type,
+                'stop_loss': stop_loss,
+                'entry_trigger': entry_trigger
+            }
+            
+            # Send detailed Telegram notification
+            emoji = "🔄" if pattern_type == "DIVERGENCE" else ("🧱" if pattern_type == "ABSORPTION" else "🚀")
+            msg = f"{emoji} <b>[OF] {pattern_type} TRADE OPENED</b>\n"
+            msg += f"Symbol: {symbol.upper()}\n"
+            msg += f"Side: <b>{signal_side}</b>\n"
+            msg += f"Pattern: {pattern_type}\n"
+            msg += f"Confidence: {confidence:.1%}\n"
+            msg += f"Entry: ${current_price:.2f}\n"
+            msg += f"Stop Loss: ${stop_loss:.2f} ({stop_loss_pct:.2%})\n"
+            msg += f"Trigger: {entry_trigger}"
             
             self.send_telegram_message(msg)
+            
+            logger.info(
+                f"📊 {symbol.upper()} | [OF] {pattern_type} TRADE OPENED | "
+                f"{signal_side} @ ${current_price:.2f} | SL: ${stop_loss:.2f} ({stop_loss_pct:.2%})"
+            )
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error executing Order Flow trade for {symbol}: {e}")
+            return False
+        
+        finally:
+            # Restore original stop loss settings
+            self.paper_trader.SL_PCT = original_sl_pct
+            self.paper_trader.TSL_PCT = original_tsl_pct
 
 
-        
-        # Check for midnight report (once per day)
-        current_time = datetime.now()
-        
-        # If it's between 00:00 and 00:05
-        if 0 <= current_time.hour < 1 and current_time.minute < 5:
-            # Check if we already sent it today
-            if self.last_midnight_report_time is None or self.last_midnight_report_time.day != current_time.day:
-                logger.info("Sending midnight market regime report...")
-                msg = f"🌙 <b>Daily Market Regime Report</b>\n\n"
-                msg += f"Current Season: <b>{season}</b>\n"
-                msg += f"Confidence: {confidence:.2%}\n"
-                msg += f"Details: {details}\n"
-                self.send_telegram_message(msg)
+    # ------------------------------------------------------------------------
+    # LIVE PREDICTION LOOP (Client Consumation)
+    # ------------------------------------------------------------------------
+    def on_message(self, ws, message):
+        try:
+            data = json.loads(message)
+        except:
+            return
+
+        symbol = data.get('symbol', '').lower()
+        if symbol not in self.symbols:
+            return
+
+        logger.info(f"📨 Incoming message for {symbol.upper()} | Price: ${data.get('close', 'N/A')}")
+
+        with self.lock:
+            # Append new data
+            self.latest_data[symbol].append(data)
+
+            # Maintain buffer size (keep last 500)
+            if len(self.latest_data[symbol]) > 500:
+                self.latest_data[symbol] = self.latest_data[symbol][-500:]
+
+            # Need minimum 200 rows for rolling features
+            if len(self.latest_data[symbol]) < 200:
+                logger.info(f"⏳ {symbol.upper()} | Buffer size: {len(self.latest_data[symbol])}/200 - waiting for more data")
+                return
+
+            # Preis extrahieren für den Paper Trader
+            try:
+                current_price = float(data.get('close'))
+            except:
+                return  # Ohne Preis kein Trading
+
+            # =========================================================
+            # FEED DATA TO PAPER TRADER FOR CHART GENERATION
+            # =========================================================
+            # Add bucketed trade data to paper trader so it can generate charts on exit
+            try:
+                bucket_data = {
+                    'timestamp': data.get('timestamp', datetime.now().timestamp()),
+                    'price': current_price,
+                    'volume': float(data.get('total_volume', 0)),
+                    'buy_volume': float(data.get('taker_buy_volume', 0)),
+                    'sell_volume': float(data.get('total_volume', 0)) - float(data.get('taker_buy_volume', 0))
+                }
+                self.paper_trader.add_bucketed_trade(symbol, bucket_data)
+            except Exception as e:
+                logger.warning(f"Failed to add bucketed trade data for {symbol}: {e}")
+
+            # =========================================================
+            # 1. PAPER TRADER UPDATE (Check Exits FIRST)
+            # =========================================================
+            # Prüft bei JEDEM Tick, ob der TSL oder SL getroffen wurde.
+            # Wenn ja, wird der Trade geschlossen und geloggt.
+            self.paper_trader.update_trade(symbol, current_price, datetime.now())
+
+            # =========================================================
+            # 2. ROTTING SIGNAL LOGIC (Shadow Ledger Check)
+            # =========================================================
+            # Check if symbol is in active_trades (Shadow Ledger)
+            if symbol in self.active_trades:
+                trade_info = self.active_trades[symbol]
+                shadow_entry_price = trade_info['entry_price']
+                start_time = trade_info['start_time']
                 
-                # Update last report time
-                self.last_midnight_report_time = current_time
+                # Calculate trade duration
+                now = datetime.now()
+                duration = (now - start_time).total_seconds()
+                
+                # Calculate estimated PnL based on side
+                if trade_info['side'] == 'LONG':
+                    estimated_pnl = (current_price - shadow_entry_price) / shadow_entry_price
+                else:  # SHORT
+                    estimated_pnl = (shadow_entry_price - current_price) / shadow_entry_price
+                
+                # TIME-BASED EXIT: If 15 minutes passed and profit < 0.2%
+                if duration > 900 and estimated_pnl < 0.002:
+                    logger.info(f"⏳ {symbol.upper()} | Time Decay exit | Duration: {duration:.0f}s | PnL: {estimated_pnl:.2%}")
+                    self.paper_trader.close_trade(symbol, current_price, "TIME_DECAY", estimated_pnl, datetime.now())
+                    # Remove from shadow ledger
+                    del self.active_trades[symbol]
+
+            # 2. Feature Engineering
+            # Convert list of dicts to DataFrame (last 200 rows)
+            # Note: The websocket data keys must match what add_market_features expects
+            df = pd.DataFrame(self.latest_data[symbol][-200:])
+
+            # Ensure numeric types
+            cols = ['close', 'open', 'high', 'low', 'total_volume', 'taker_buy_volume', 'bar_duration_ms',
+                    'trade_count']
+            for c in cols:
+                if c in df.columns:
+                    df[c] = pd.to_numeric(df[c])
+
+            df = self.add_market_features(df)
+
+            current_row = df.iloc[-1]
+            z_score = current_row['flow_z_score']
+
+            logger.info(f"✅ {symbol.upper()} | Features calculated | Z-Score: {z_score:.2f}")
+
+            # =========================================================
+            # 2.5. ORDER FLOW STRATEGY SIGNAL CHECK
+            # =========================================================
+            orderflow_signal = self._check_orderflow_signal(symbol, df)
+            
+            # Execute Order Flow trade if signal is strong enough
+            # Order Flow trades run independently with their own stop loss logic
+            orderflow_trade_executed = False
+            if orderflow_signal and orderflow_signal.get('signal') and orderflow_signal.get('confidence', 0) >= 0.6:
+                trade_setup = orderflow_signal.get('trade_setup')
+                if trade_setup:
+                    pattern_type = trade_setup.get('pattern_type', 'UNKNOWN')
+                    logger.info(
+                        f"📈 {symbol.upper()} | ORDER FLOW {pattern_type} | "
+                        f"{orderflow_signal['signal']} | Conf: {orderflow_signal['confidence']:.1%}"
+                    )
+                    
+                    # Execute the Order Flow trade with custom stops
+                    orderflow_trade_executed = self.execute_orderflow_trade(
+                        symbol=symbol,
+                        signal_result=orderflow_signal,
+                        current_price=current_price
+                    )
+                    
+                    if orderflow_trade_executed:
+                        # Broadcast to Hedge Bot with Order Flow marker
+                        self.broadcast_hedge_signal(
+                            symbol=symbol,
+                            side=orderflow_signal['signal'],
+                            confidence=orderflow_signal['confidence'],
+                            price=current_price
+                        )
+                        # Return early - Order Flow trade was executed
+                        return
+            
+            # 3. CHECK PRIMARY SIGNAL (Stage 1)
+            is_long_signal = z_score > PRIMARY_Z_SCORE_THRESHOLD
+            is_short_signal = z_score < -PRIMARY_Z_SCORE_THRESHOLD
+            
+            # Order Flow can still influence primary signal direction if trade wasn't executed
+            if not orderflow_trade_executed and orderflow_signal and orderflow_signal['signal']:
+                of_signal = orderflow_signal['signal']
+                of_confidence = orderflow_signal['confidence']
+                of_reason = orderflow_signal['reason']
+                
+                # If Order Flow has signal but didn't execute (low confidence), still consider direction
+                if of_confidence >= 0.5:
+                    if of_signal == 'LONG':
+                        is_long_signal = True
+                        is_short_signal = False
+                    elif of_signal == 'SHORT':
+                        is_short_signal = True
+                        is_long_signal = False
+                    logger.info(f"📊 {symbol.upper()} | Order Flow INFLUENCE | {of_signal} | Conf: {of_confidence:.1%} | {of_reason}")
+
+            if not (is_long_signal or is_short_signal):
+                logger.info(f"⚠️ {symbol.upper()} | No primary signal | Z-Score: {z_score:.2f} (threshold: ±{PRIMARY_Z_SCORE_THRESHOLD})")
+                return
+
+
+            signal_direction = "LONG" if is_long_signal else "SHORT"
+            logger.info(f"🎯 {symbol.upper()} | Primary signal detected: {signal_direction} | Z-Score: {z_score:.2f}")
+
+            # 4. CHECK META-MODEL (Stage 2)
+            if symbol not in self.meta_models:
+                logger.warning(f"❌ {symbol.upper()} | No meta-model available for prediction")
+                return
+
+            features = current_row[self.feature_cols].values.reshape(1, -1)
+            success_prob = self.meta_models[symbol].predict(features)[0]
+
+            logger.info(f"🤖 {symbol.upper()} | Meta-model prediction | Confidence: {success_prob:.1%} (threshold: {META_CONFIDENCE_THRESHOLD:.1%})")
+
+            # =========================================================
+            # 5. PAPER TRADER ENTRY
+            # =========================================================
+            if success_prob > META_CONFIDENCE_THRESHOLD:
+                signal_type = "LONG" if is_long_signal else "SHORT"
+
+                # Versuch Trade zu öffnen.
+                # Die Klasse ignoriert es automatisch, wenn schon einer offen ist.
+                self.paper_trader.execute_signal(
+                    symbol=symbol,
+                    signal_side=signal_type,
+                    price=current_price,
+                    timestamp=datetime.now(),
+                    confidence=success_prob,
+                    z_score=z_score
+                )
+                
+                # Populate Shadow Ledger immediately after execute_signal
+                self.active_trades[symbol] = {
+                    'entry_price': current_price,
+                    'start_time': datetime.now(),
+                    'side': signal_type
+                }
+
+
+            # 6. EXECUTION
+            if success_prob > META_CONFIDENCE_THRESHOLD:
+                signal_type = "LONG" if is_long_signal else "SHORT"
+                emoji = "🚀" if is_long_signal else "📉"
+
+                logger.info(
+                    f"🔥 VALID SIGNAL {symbol.upper()} | {signal_type} | Z: {z_score:.2f} | Conf: {success_prob:.1%}")
+
+                msg = f"{emoji} <b>SIGNAL: {symbol.upper()}</b>\n"
+                msg += f"Type: <b>{signal_type}</b>\n"
+                msg += f"AI Conf: <code>{success_prob:.1%}</code>\n"
+                msg += f"Price: <code>${current_row['close']:.2f}</code>"
+
+                # self.send_telegram_message(msg)
+
+                # Broadcast to Hedge Bot
+                self.broadcast_hedge_signal(symbol, signal_type, success_prob, current_row['close'])
+            else:
+                logger.info(f"🚫 {symbol.upper()} | Signal REJECTED | Confidence too low: {success_prob:.1%}")
+
+    # ------------------------------------------------------------------------
+    # WEBSOCKET SERVER (Hedge Bot Communication)
+    # ------------------------------------------------------------------------
+    def broadcast_hedge_signal(self, symbol, side, confidence, price):
+        if not self.server_clients:
+            return
+        payload = json.dumps({
+            "type": "SIGNAL",
+            "symbol": symbol,
+            "side": side,
+            "confidence": float(confidence),
+            "price": float(price),
+            "timestamp": datetime.now().isoformat()
+        })
+        # Thread-safe broadcast
+        asyncio.run_coroutine_threadsafe(self._send_all(payload), self.server_loop)
+
+    async def _send_all(self, msg):
+        if not self.server_clients:
+            return
+        tasks = [asyncio.create_task(client.send(msg)) for client in self.server_clients]
+        await asyncio.wait(tasks)
+
+    async def websocket_handler(self, websocket):
+        """Auth and Connection Handler"""
+        try:
+            auth_header = websocket.request_headers.get("Authorization", "")
+            if not auth_header.startswith("Bearer "):
+                await websocket.close(code=1008)
+                return
+            token = auth_header.split(" ")[1]
+            if token != AUTH_BEARER_TOKEN_OUTGOING:
+                await websocket.close(code=1008)
+                return
+
+            logger.info(f"Hedge Bot Connected: {websocket.remote_address}")
+            self.server_clients.add(websocket)
+            await websocket.wait_closed()
+        except Exception as e:
+            logger.error(f"WS Handler Error: {e}")
+        finally:
+            self.server_clients.discard(websocket)
+
+    def start_websocket_server(self):
+        """Starts AsyncIO Server in Thread"""
+        self.server_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.server_loop)
+
+        async def run_server():
+            async with websockets.serve(self.websocket_handler, "0.0.0.0", 8765):
+                logger.info("Hedge Bot Signal Server running on port 8765")
+                await asyncio.Future()  # Run forever
+
+        try:
+            self.server_loop.run_until_complete(run_server())
+        except Exception as e:
+            logger.error(f"Server crash: {e}")
+        finally:
+            self.server_loop.close()
 
     def on_error(self, ws, error):
         logger.error(f"WebSocket Error: {error}")
@@ -1667,326 +1204,136 @@ class MarketPredictor:
     def on_open(self, ws):
         logger.info("WebSocket Connection Opened")
 
-    def start_live_prediction(self, historical_data=None):
-        # Check if at least one model is trained
-        if not self.models or all(model is None for model in self.models.values()):
-            logger.error("No models trained! Cannot start live prediction.")
-            return
+    def run_scheduled_retraining(self):
+        """Full pipeline: Download fresh data -> Label -> Train -> Hot Swap"""
+        logger.info("🔄 STARTING SCHEDULED RETRAINING PIPELINE...")
 
-        logger.info("Starting live prediction...")
-        
-        # Start Hedge Bot Server
+        # Initialize DatasetLabeler to reuse training preparation functions
+        labeler = DatasetLabeler()
+
+        for symbol in self.symbols:
+            try:
+                logger.info(f"Processing {symbol} for retraining...")
+
+                # Use prepare_training_dataset from dataset_labeler.py instead of re-implementing
+                # This handles: data fetching, primary signals, TBM labels, meta labels, and features
+                df = labeler.prepare_training_dataset(
+                    symbol=symbol,
+                    days=30,
+                    primary_strategy='volume_imbalance',
+                    lookahead=int(os.getenv("LOOKAHEAD_PERIODS", "100")),
+                    tp_pct=float(os.getenv("TAKE_PROFIT_PCT", "0.0005")),
+                    sl_pct=float(os.getenv("STOP_LOSS_PCT", "0.00025"))
+                )
+
+                if df.empty or len(df) < 100:
+                    logger.warning(f"❌ Not enough data for {symbol}. Skipping retraining.")
+                    continue
+
+                # Save dataset for training (keep only rows with primary signals)
+                training_data = df[df['primary_signal'] == 1].copy()
+                dataset_path = f"meta_labeling_dataset_{symbol}.csv"
+                training_data.to_csv(dataset_path, index=False)
+                logger.info(f"Saved fresh labeled dataset to {dataset_path} ({len(training_data)} samples)")
+
+                # Train Model using the existing train_meta_model function
+                new_model = self.train_meta_model(symbol, dataset_path)
+
+                # Hot Swap (Update the live model in memory)
+                if new_model:
+                    with self.lock:
+                        self.meta_models[symbol] = new_model
+                    logger.info(f"✅ SUCCESSFULLY HOT-SWAPPED MODEL FOR {symbol}")
+
+            except Exception as e:
+                logger.error(f"Failed to retrain {symbol}: {e}")
+
+    def retraining_scheduler_loop(self):
+        """Background thread checking if it's time to retrain"""
+        retrain_interval_hours = 72  # 3 Days
+        initial_delay_hours = 72  # Wait 3 days before starting scheduler
+
+        # Initial delay: wait 3 days after service start before beginning checks
+        logger.info(f"⏰ Retraining Scheduler will start in {initial_delay_hours} hours (3 days)")
+        time.sleep(initial_delay_hours * 3600)
+        logger.info("📅 Retraining Scheduler now active (Checks every hour, triggers every 3 days)")
+
+        while self.running:
+            # Check model age
+            for symbol in self.symbols:
+                model_file = self.get_meta_model_file(symbol)
+                if os.path.exists(model_file):
+                    file_time = datetime.fromtimestamp(os.path.getmtime(model_file))
+                    age = datetime.now() - file_time
+
+                    if age.total_seconds() > (retrain_interval_hours * 3600):
+                        logger.info(f"Model for {symbol} is {age.days} days old. Triggering retraining...")
+                        self.run_scheduled_retraining()
+                        # Wait a bit after retraining to avoid spamming
+                        time.sleep(3600)
+                        break  # Restart loop to re-check fresh timestamps
+
+            # Sleep 1 hour before checking again
+            time.sleep(3600)
+
+    # ------------------------------------------------------------------------
+    # MAIN RUN
+    # ------------------------------------------------------------------------
+    def run(self):
+        # 1. Load Models
+        self.load_meta_models()
+
+        # 2. Start Retraining Scheduler (Background Thread)
+        self.retrain_thread = threading.Thread(target=self.retraining_scheduler_loop, daemon=True)
+        self.retrain_thread.start()
+        logger.info("📅 Retraining Scheduler thread started (Will activate after 3-day initial delay)")
+
+        # 3. Pre-fill Buffers with Historical Data (Crucial for cold start)
+        logger.info("🔄 Loading historical data to populate buffers...")
+        hist_df = self.fetch_historical_data(days=2)
+        if not hist_df.empty:
+            for symbol in self.symbols:
+                # Extract data for symbol, convert timestamp to string (simulating WS format if needed)
+                # or keep as dicts. 'latest_data' expects list of dicts.
+                sym_data = hist_df[hist_df['symbol'] == symbol.upper()].copy()
+                if not sym_data.empty:
+                    # Convert to records
+                    records = sym_data.to_dict('records')
+                    self.latest_data[symbol] = records[-2000:]  # Keep last 2000
+                    logger.info(f"✅ Pre-filled {symbol} buffer with {len(self.latest_data[symbol])} records")
+            
+            # Mark buffers as ready - charts can now be generated safely
+            with self.lock:
+                self.buffers_ready = True
+            logger.info("✅ All buffers populated with historical data - charts ready for generation")
+        else:
+            logger.warning("⚠️ Failed to fetch historical data - buffers will be populated from live WebSocket data")
+            logger.warning("⚠️ Charts will not be available until sufficient live data is collected")
+
+        # 4. Start Hedge Bot Server
         self.server_thread = threading.Thread(target=self.start_websocket_server, daemon=True)
         self.server_thread.start()
-        
-        # Pre-fill buffer with historical data per symbol
-        if historical_data is not None and not historical_data.empty:
-            # Group by symbol and pre-fill each buffer
-            for symbol in self.symbols:
-                symbol_data = historical_data[historical_data['symbol'] == symbol.upper()]
-                if not symbol_data.empty:
-                    # Convert to list of dicts and take last 20000
-                    # Note: historical_data has datetime objects for start_ts, WS has strings.
-                    # We'll handle this mixed type in check_and_send_notifications.
-                    records = symbol_data.to_dict('records')
-                    # Ensure we don't exceed the buffer size we want to maintain
-                    self.latest_data[symbol] = records[-20000:]
-                    logger.info(f"Pre-filled buffer for {symbol} with {len(self.latest_data[symbol])} records from history.")
-                    
-                    # Run initial prediction on historical data to populate status
-                    if len(self.latest_data[symbol]) >= 20 and symbol in self.models and self.models[symbol]:
-                        try:
-                            df = pd.DataFrame(self.latest_data[symbol])
-                            df = self.prepare_features(df)
-                            last_row = df.iloc[-1]
-                            
-                            features = last_row[self.feature_cols].values.reshape(1, -1)
-                            prediction = self.models[symbol].predict(features)
-                            pred_class = np.argmax(prediction[0])
-                            probs = prediction[0]
-                            
-                            direction_map = {0: "NEUTRAL", 1: "PUMP", 2: "DUMP"}
-                            
-                            # Predict (LSTM) if available
-                            lstm_pred_class = -1
-                            lstm_probs = [0.0, 0.0, 0.0]
-                            lstm_direction = "N/A"
-                            
-                            if self.ENABLE_LSTM and symbol in self.lstm_models and symbol in self.lstm_scalers:
-                                try:
-                                    # Need last 200 rows for LSTM
-                                    if len(df) >= 200:
-                                        lstm_input_df = df.iloc[-200:]
-                                        lstm_features = lstm_input_df[self.feature_cols].values
-                                        # Scale
-                                        lstm_scaled = self.lstm_scalers[symbol].transform(lstm_features)
-                                        # Reshape to (1, 200, n_features)
-                                        lstm_input = lstm_scaled.reshape(1, 200, lstm_scaled.shape[1])
-                                        
-                                        lstm_prediction = self.lstm_models[symbol].predict(lstm_input, verbose=0)
-                                        lstm_pred_class = np.argmax(lstm_prediction[0])
-                                        lstm_probs = lstm_prediction[0]
-                                        
-                                        lstm_direction = direction_map[lstm_pred_class]
-                                        
-                                        # Update cache
-                                        self.last_lstm_predictions[symbol] = {
-                                            'direction': lstm_direction,
-                                            'probs': lstm_probs,
-                                            'pred_class': lstm_pred_class
-                                        }
-                                except Exception as e:
-                                    logger.error(f"Initial LSTM prediction error for {symbol}: {e}")
-                            
-                            self.last_prediction_data[symbol] = {
-                                'timestamp': last_row['start_ts'],
-                                'price': last_row['close'],
-                                'delta': last_row['delta'],
-                                'direction': direction_map[pred_class],
-                                'confidence': probs[pred_class],
-                                'probs': {
-                                    'NEUTRAL': float(probs[0]),
-                                    'PUMP': float(probs[1]),
-                                    'DUMP': float(probs[2])
-                                },
-                                'pred_class': int(pred_class),
-                                'lstm_direction': lstm_direction,
-                                'lstm_confidence': float(lstm_probs[lstm_pred_class]) if lstm_direction != "N/A" else 0.0,
-                                'lstm_probs': {
-                                    'NEUTRAL': float(lstm_probs[0]),
-                                    'PUMP': float(lstm_probs[1]),
-                                    'DUMP': float(lstm_probs[2])
-                                } if lstm_direction != "N/A" else {'NEUTRAL': 0.0, 'PUMP': 0.0, 'DUMP': 0.0}
-                            }
-                        except Exception as e:
-                            logger.error(f"Error running initial prediction for {symbol}: {e}")
 
-        # Check if we can send initial status message immediately
-        if not self.initial_message_sent:
-            if all(self.last_prediction_data.get(s) for s in self.symbols):
-                logger.info("Sending initial status message from historical data...")
-                self.send_status_message("🚀 <b>Bot Started - Initial Status</b>")
-                self.initial_message_sent = True
-        
+        # 5. Start Data Stream
         websocket.enableTrace(False)
         ws_headers = {}
         if AUTH_TOKEN:
             ws_headers["Authorization"] = f"Bearer {AUTH_TOKEN}"
 
-        # Signal handlers are registered in __init__
+        ws_url = f"{WS_URL}?symbols={','.join(self.symbols)}"
 
-        # Add symbols parameter to WebSocket URL
-        ws_url_with_symbols = f"{WS_URL}?symbols={','.join(self.symbols)}"
-        
-        self.ws = websocket.WebSocketApp(ws_url_with_symbols,
-                                  on_open=self.on_open,
-                                  on_message=self.on_message,
-                                  on_error=self.on_error,
-                                  on_close=self.on_close,
-                                  header=ws_headers)
-
+        logger.info(f"Connecting to Data Stream: {WS_URL}")
+        self.ws = websocket.WebSocketApp(
+            ws_url,
+            on_message=self.on_message,
+            on_open=self.on_open,
+            on_error=self.on_error,
+            on_close=self.on_close,
+            header=ws_headers
+        )
         self.ws.run_forever()
 
 
-    def check_for_trigger(self, symbol, prob_pump, prob_dump, ofi):
-        # Determine current raw signal
-        current_signal = "WAIT"
-
-        # --- UP TREND TRIGGER (PUMP) ---
-        # Logic: Model thinks Pump is likely (>40%) AND Order Flow confirms buying (>0.5)
-        if prob_pump > self.PROB_THRESHOLD and ofi > self.OFI_THRESHOLD:
-            current_signal = "LONG_ENTRY"
-
-        # --- DOWN TREND TRIGGER (DUMP) ---
-        # Logic: Model thinks Dump is likely (>40%) AND Order Flow confirms selling (<-0.5)
-        elif prob_dump > self.PROB_THRESHOLD and ofi < -self.OFI_THRESHOLD:
-            current_signal = "SHORT_ENTRY"
-
-        # Get previous state
-        if symbol not in self.signal_counters:
-            self.signal_counters[symbol] = {'type': 'WAIT', 'count': 0}
-            
-        state = self.signal_counters[symbol]
-        
-        # Check for consecutive signals
-        if current_signal == state['type'] and current_signal != "WAIT":
-            state['count'] += 1
-            # Cap the counter to prevent infinite growth since we only care about the threshold
-            if state['count'] > self.CONSECUTIVE_SIGNAL_THRESHOLD + 10:
-                state['count'] = self.CONSECUTIVE_SIGNAL_THRESHOLD + 1
-        else:
-            # Reset or start new count
-            state['type'] = current_signal
-            state['count'] = 1 if current_signal != "WAIT" else 0
-            
-        # Trigger ONLY on the exact Nth occurrence
-        # This prevents endless messages when the trigger remains True for a long time
-        if state['count'] == self.CONSECUTIVE_SIGNAL_THRESHOLD:
-            logger.info(f"Trigger confirmed for {symbol}: {current_signal} (3 consecutive signals)")
-            return current_signal
-            
-        return "WAIT"
-
-    # --- WEBSOCKET SERVER FOR HEDGE BOT ---
-    
-    async def websocket_handler(self, websocket):
-        """Handle incoming WebSocket connections from Hedge Bots"""
-        # 1. Authenticate
-        try:
-            # Get Authorization header
-            # Note: websocket.request_headers works in websockets library
-            auth_header = websocket.request_headers.get("Authorization", "")
-            
-            # Check format "Bearer <token>"
-            if not auth_header.startswith("Bearer "):
-                logger.warning(f"Rejected connection from {websocket.remote_address}: Missing or invalid Bearer header")
-                await websocket.close(code=1008, reason="Missing Authorization Header")
-                return
-                
-            # Check token
-            token = auth_header.split(" ")[1]
-            if token != AUTH_BEARER_TOKEN_OUTGOING:
-                logger.warning(f"Rejected connection from {websocket.remote_address}: Invalid token")
-                await websocket.close(code=1008, reason="Invalid Token")
-                return
-                
-            logger.info(f"Authenticated client connected from {websocket.remote_address}")
-            
-        except Exception as e:
-            logger.error(f"Authentication error: {e}")
-            await websocket.close(code=1011, reason="Internal Auth Error")
-            return
-
-        self.server_clients.add(websocket)
-        logger.info(f"Hedge Bot connected. Total clients: {len(self.server_clients)}")
-        try:
-            await websocket.wait_closed()
-        finally:
-            self.server_clients.remove(websocket)
-            logger.info(f"Hedge Bot disconnected. Total clients: {len(self.server_clients)}")
-
-    def start_websocket_server(self):
-        """Start the asyncio WebSocket server in a separate thread"""
-        logger.info("Starting Hedge Bot WebSocket Server on port 8765...")
-        
-        # Create a new event loop for this thread
-        self.server_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.server_loop)
-        
-        async def run_server():
-            # websockets.serve returns a Server object which is an async context manager
-            async with websockets.serve(self.websocket_handler, "0.0.0.0", 8765):
-                logger.info("WebSocket Server running...")
-                # Keep the server running indefinitely
-                await asyncio.Future() 
-
-        try:
-            self.server_loop.run_until_complete(run_server())
-        except Exception as e:
-            logger.error(f"WebSocket Server crashed: {e}")
-        finally:
-            self.server_loop.close()
-
-    def broadcast_hedge_data(self, data):
-        """Broadcast data to all connected WebSocket clients (Thread-Safe)"""
-        if not self.server_clients or not self.server_loop:
-            return
-
-        async def _send():
-            if not self.server_clients:
-                return
-            message = json.dumps(data)
-            # websockets.broadcast is available in newer versions, but loop iteration is safer for older ones
-            # or simply iterate
-            tasks = [asyncio.create_task(client.send(message)) for client in self.server_clients]
-            if tasks:
-                await asyncio.wait(tasks)
-
-        try:
-            asyncio.run_coroutine_threadsafe(_send(), self.server_loop)
-        except Exception as e:
-            logger.error(f"Error broadcasting hedge data: {e}")
-
 if __name__ == "__main__":
-    logger.info(f"Initializing Market Predictor for symbols: {SYMBOLS}")
     predictor = MarketPredictor(SYMBOLS)
-    
-    # Notify Start
-    try:
-        predicted_start_msg = f"🟢 <b>Service Starting</b>\nSymbols: {', '.join([s.upper() for s in SYMBOLS])}"
-        predictor.send_telegram_message(predicted_start_msg)
-    except:
-        pass
-    
-    try:
-        # 1. Check for existing models and load them
-        models_loaded = {}
-        lstm_models_loaded = {}
-        
-        for symbol in SYMBOLS:
-            models_loaded[symbol] = predictor.load_model_if_valid(symbol, max_age_days=2)
-            if models_loaded[symbol]:
-                logger.info(f"✓ LGBM Model loaded for {symbol}")
-            else:
-                logger.info(f"✗ LGBM Model not found or too old for {symbol}")
-                
-            # Check LSTM
-            lstm_models_loaded[symbol] = predictor.load_lstm_model_if_valid(symbol, max_age_days=3)
-            if lstm_models_loaded[symbol]:
-                logger.info(f"✓ LSTM Model loaded for {symbol}")
-            else:
-                logger.info(f"✗ LSTM Model not found or too old for {symbol}")
-        
-        # 2. Fetch Data
-        # If all models are loaded, we just need enough data for the buffer (e.g. 2 days)
-        # If we need to train any model, we fetch more (e.g. 5 days)
-        all_lgbm_loaded = all(models_loaded.values())
-        all_lstm_loaded = all(lstm_models_loaded.values()) if predictor.ENABLE_LSTM else True
-        
-        days_to_fetch = 2 if (all_lgbm_loaded and all_lstm_loaded) else 5
-        fetch_golden = not (all_lgbm_loaded and all_lstm_loaded)
-        
-        logger.info(f"Fetching {days_to_fetch} days of historical data... (Fetch Golden: {fetch_golden})")
-        df = predictor.fetch_historical_data(SYMBOLS, days=days_to_fetch, fetch_golden=fetch_golden)
-        
-        if not df.empty and len(df) > 10:
-            # 3. Train Models if needed (per symbol)
-            for symbol in SYMBOLS:
-                # Filter data for this symbol
-                symbol_df = df[df['symbol'] == symbol.upper()].copy()
-                
-                if not models_loaded[symbol]:
-                    logger.info(f"Training LGBM model for {symbol.upper()}...")
-                    if len(symbol_df) > 10:
-                        predictor.train_model(symbol.upper(), symbol_df)
-                        logger.info(f"✓ LGBM Model trained for {symbol.upper()}")
-                    else:
-                        logger.warning(f"✗ Not enough data for {symbol.upper()}. Skipping LGBM training.")
-                
-                # Train LSTM if enabled and not loaded
-                if predictor.ENABLE_LSTM and not lstm_models_loaded[symbol]:
-                    predictor.train_lstm_model(symbol.upper(), symbol_df)
-        else:
-            logger.warning(f"Not enough historical data fetched ({len(df)} records). Starting without pre-filling buffer.")
-        
-        # 4. Start Automatic Retraining Scheduler
-        logger.info("Starting automatic retraining scheduler (checks every 24 hours for models >= 7 days old)...")
-        predictor.start_retraining_scheduler()
-            
-        # 5. Live Predict
-        predictor.start_live_prediction(df)
-        
-    except KeyboardInterrupt:
-        logger.info("Stopping...")
-        try:
-            predictor.send_telegram_message("🛑 <b>Service Stopped</b>\nKeyboard Interrupt.")
-        except:
-            pass
-    except Exception as e:
-        logger.error(f"Fatal Service Error: {e}", exc_info=True)
-        try:
-            predictor.send_telegram_message(f"☠️ <b>Service Died</b>\nError: {str(e)}")
-        except:
-            pass
-        sys.exit(1)
-
+    predictor.run()
